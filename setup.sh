@@ -1,10 +1,11 @@
 #!/usr/bin/env bash
 # One entry point for the whole stack.
 #
-#   ./setup.sh all             # engine + model + observability + verify
+#   ./setup.sh all             # engine + model + observability + RAG + verify
 #   ./setup.sh llm             # Ollama only
 #   ./setup.sh model           # GGUF download + model registration
 #   ./setup.sh observability   # metrics exporter (+ optional Grafana stack)
+#   ./setup.sh rag             # seed ChromaDB RAG corpus
 #   ./setup.sh verify          # readiness checks
 #   ./setup.sh status          # human-readable current state
 #
@@ -26,11 +27,13 @@ case "${cmd}" in
     bash scripts/setup_llm.sh
     bash scripts/setup_model.sh
     bash scripts/setup_observability.sh
+    python3 rag/seed_chroma.py
     bash scripts/verify_stack.sh --full
     ;;
   llm)           bash scripts/setup_llm.sh ;;
   model)         shift; bash scripts/setup_model.sh "$@" ;;
   observability) bash scripts/setup_observability.sh ;;
+  rag)           shift; python3 rag/seed_chroma.py --reset "$@" ;;
   verify)        shift; bash scripts/verify_stack.sh "$@" ;;
   status)
     source scripts/lib/common.sh

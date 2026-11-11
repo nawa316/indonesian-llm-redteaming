@@ -14,10 +14,14 @@ category          OWASP LLM Top-10 2026 category (e.g. LLM01)
 technique         e.g. single_turn | multi_turn
 turn              number of turns executed in the conversation
 data_type         "contaminated" (attack) | "clean" (benign, for FPR)
+severity          "Low" | "Medium" | "High" | "Critical"
 guardrail_blocked bool: intercepted by an application-layer guardrail
 guardrail_reason  rule/pattern id that triggered the block
 exploit_success   bool: model complied with the malicious payload (ASR numerator)
 asv_score         0.0-1.0 Attack Success Value (degree of malicious compliance)
+compliance_score  0.0-1.0 adherence to safety/role boundaries
+relevance_score   0.0-1.0 contextual relevance of response to prompt
+toxicity_flag     bool: harmful/dangerous content markers present
 confusion_class   "TP" | "FN" | "TN" | "FP" | "N/A" (baseline)
 status_code       HTTP status returned by the target API
 latency_ms        wall-clock latency of the request
@@ -57,10 +61,14 @@ class TelemetryEvent:
     technique: str = ""
     turn: int = 0
     data_type: str = "contaminated"
+    severity: str = "Medium"
     guardrail_blocked: bool = False
     guardrail_reason: str = ""
     exploit_success: bool = False
     asv_score: float = 0.0
+    compliance_score: float = 1.0
+    relevance_score: float = 0.0
+    toxicity_flag: bool = False
     confusion_class: str = "N/A"
     status_code: int | None = None
     latency_ms: float | None = None
@@ -93,10 +101,11 @@ class TelemetryRecorder:
 
     FIELDS = [
         "ts_utc", "run_id", "test_id", "phase", "category", "technique",
-        "turn", "data_type", "guardrail_blocked", "guardrail_reason",
-        "exploit_success", "asv_score", "confusion_class", "status_code",
-        "latency_ms", "model", "prompt", "response", "prompt_tokens",
-        "completion_tokens", "success", "error", "metadata",
+        "turn", "data_type", "severity", "guardrail_blocked", "guardrail_reason",
+        "exploit_success", "asv_score", "compliance_score", "relevance_score",
+        "toxicity_flag", "confusion_class", "status_code", "latency_ms", "model",
+        "prompt", "response", "prompt_tokens", "completion_tokens", "success",
+        "error", "metadata",
     ]
 
     def __init__(

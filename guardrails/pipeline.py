@@ -16,9 +16,13 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
 
 from guardrails.input_filter import InputFilter
 from guardrails.output_filter import OutputFilter
+
+if TYPE_CHECKING:
+    from guardrails.rag_filter import RAGFilter, RAGResult
 
 
 @dataclass(frozen=True)
@@ -50,6 +54,7 @@ class GuardrailPipeline:
         enabled: bool = True,
         input_filter: InputFilter | None = None,
         output_filter: OutputFilter | None = None,
+        rag_filter: "RAGFilter | None" = None,
     ) -> None:
         self.enabled = enabled
         self.input_filter = input_filter or InputFilter(
@@ -57,6 +62,7 @@ class GuardrailPipeline:
             max_estimated_tokens=int(os.getenv("GUARDRAIL_MAX_TOKENS", "1200")),
         )
         self.output_filter = output_filter or OutputFilter()
+        self.rag_filter = rag_filter
 
     # -- input -------------------------------------------------------------
     def screen_input(self, text: str) -> GuardrailDecision:
@@ -93,6 +99,13 @@ class GuardrailPipeline:
     def check_output(self, text: str) -> tuple[bool, str, str]:
         """Scan model output. Returns ``(allowed, reason, sanitized_text)``."""
         return self.screen_output(text).as_tuple()
+
+    # -- RAG ---------------------------------------------------------------
+    def retrieve_context(self, query: str, phase: str) -> "RAGResult | None":
+        """Retrieve RAG context; guardrails relax in baseline, tighten in mitigated."""
+        if self.rag_filter is None:
+            return None
+        return self.rag_filter.retrieve(query, phase)
 
 
 if __name__ == "__main__":  # manual sanity check

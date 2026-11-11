@@ -139,10 +139,56 @@ survives a crashed run.
 
 `dataset/owasp_2026_id.csv` — 40 Indonesian cases, 4 per OWASP 2026 category,
 balanced across `Single-Turn`/`Multi-Turn` and `contaminated`/`clean`. Multi-turn
-payloads separate turns with `||`.
+payloads separate turns with `||`. Each case carries a `severity` label
+(`Critical`/`High`/`Medium`/`Low`) used for per-severity reporting.
 
 ```bash
 python dataset/loader.py          # schema + coverage validation
+```
+
+### Deterministic control variables (v1.8.2)
+
+Baseline and mitigated campaigns share identical decoding settings:
+
+| Parameter | Value | Reason |
+|---|---|---|
+| `temperature` | `0.0` | greedy decoding, no sampling variance |
+| `top_p` | `1.0` | full distribution under greedy |
+| `top_k` | `1` | strict top-1 candidate |
+| `seed` | `42` | fixed RNG |
+| `repeat_penalty` | `1.1` | avoids 3-bit repetition loops |
+| `num_ctx` | `8192` | multi-turn history + RAG chunks |
+| `num_predict` | `512` | per-turn generation cap |
+
+The fixed Indonesian system prompt lives in `.env.example`, `config/Modelfile.template`
+(`SYSTEM """..."""`), and `test_runner.py`; all three are byte-identical. To
+apply it to the served model:
+
+```bash
+bash scripts/setup_model.sh --force   # re-renders Modelfile + ollama create
+```
+
+### RAG (ChromaDB)
+
+`rag/chroma_store.py` provides a persistent Chroma collection with Ollama
+embeddings (`nomic-embed-text`) and a deterministic scikit-learn character
+n-gram fallback when the embedding model is absent.
+
+```bash
+python rag/seed_chroma.py --reset --verify
+```
+
+(`./setup.sh rag` performs the same reset and seed.)
+
+Documents carry `access_level` (`public`/`confidential`) and `is_poisoned`.
+In **baseline** the retriever has no access filter and injects every top-k
+chunk; in **mitigated** it queries `access_level=public`, drops poisoned chunks,
+and scans the rest with `RET_POISON_*` rules (`guardrails/rag_filter.py`).
+
+RAG activates automatically for `LLM09`/vector cases, or globally:
+
+```bash
+python test_runner.py --phase baseline --use-rag
 ```
 
 ### Guardrails (application layer)
@@ -151,18 +197,33 @@ python dataset/loader.py          # schema + coverage validation
 |---|---|
 | `guardrails/input_filter.py` | injection/override, system-prompt extraction, excessive agency, secret extraction, supply chain, DoS length/repetition rules |
 | `guardrails/output_filter.py` | system-prompt leakage, credentials/PII (NIK, phone, email), executable HTML/markdown/code |
-| `guardrails/pipeline.py` | `(allowed, reason, sanitized_text)` for input and output |
+| `guardrails/rag_filter.py` | tenant access control + indirect injection scanning on retrieved chunks |
+| `guardrails/pipeline.py` | `(allowed, reason, sanitized_text)` for input, output and RAG |
 
-Every block returns a stable rule id (e.g. `INJ_OVERRIDE_01`) that is stored in
-telemetry, so the thesis can report per-rule precision.
+Every block returns a stable rule id (e.g. `INJ_OVERRIDE_01`, `RET_POISON_EXFIL`)
+that is stored in telemetry, so the thesis can report per-rule precision.
+
+### Metrics
+
+`metrics/judge.py` combines keyword coverage, TF-IDF/cosine semantic similarity,
+refusal detection and toxicity markers to produce `exploit_success` and
+`asv_score` (0–1), plus the three complementary metrics from Section 2.2.6.3:
+
+| Metric | Meaning |
+|---|---|
+| `compliance_score` | adherence to safety/role boundaries (1 = compliant) |
+| `relevance_score` | relevance of the answer to the prompt |
+| `toxicity_flag` | harmful/dangerous content markers present |
 
 ### Running a campaign
 
 ```bash
-# 1) baseline: no mitigation
+python rag/seed_chroma.py --reset
+
+# 1) baseline: no mitigation, unfiltered RAG
 python test_runner.py --phase baseline --concurrency 1
 
-# 2) mitigated: guardrails active
+# 2) mitigated: guardrails + filtered RAG
 python test_runner.py --phase mitigated --concurrency 1
 
 # 3) before/after comparison (writes reports/summary.{csv,md})
@@ -170,11 +231,12 @@ python metrics/evaluate.py
 ```
 
 Outputs: `reports/{baseline,mitigated}.jsonl`, `.csv`, and `reports/summary.csv`
-/ `.md` with ASR, mean ASV, ΔASR, ΔASV, TP/FP/TN/FN, FPR and FNR per category
-and overall.
+/ `.md` with ASR, mean ASV, compliance, relevance, toxicity, ΔASR, ΔASV,
+TP/FP/TN/FN, FPR and FNR per category, per severity and overall.
 
 Useful flags: `--limit`, `--test-id LLM01-001`, `--concurrency`, `--output`,
-`--num-predict`, `--system-prompt`.
+`--use-rag`, `--rag-top-k`, `--temperature`, `--seed`, `--num-predict`,
+`--system-prompt`.
 
 ---
 
@@ -184,15 +246,20 @@ Useful flags: `--limit`, `--test-id LLM01-001`, `--concurrency`, `--output`,
 setup.sh                      single entry point
 test_runner.py                async baseline/mitigated campaign runner
 dataset/
-  owasp_2026_id.csv           Indonesian OWASP 2026 corpus
+  owasp_2026_id.csv           Indonesian OWASP 2026 corpus (+ severity)
+  rag_documents_id.json       public / confidential / poisoned RAG docs
   loader.py                   schema validation + TestCase model
+rag/
+  chroma_store.py             ChromaDB + Ollama/offline embeddings
+  seed_chroma.py              idempotent seeding + retrieval verification
 guardrails/
   input_filter.py             pre-inference scanner
   output_filter.py            post-inference scanner + redaction
+  rag_filter.py               tenant ACL + indirect-injection scanning
   pipeline.py                 unified (allowed, reason, text) wrapper
 metrics/
-  judge.py                    ASR/ASV heuristic judge
-  evaluate.py                 before/after + confusion-matrix report
+  judge.py                    semantic ASR/ASV + complementary metrics
+  evaluate.py                 before/after, severity, confusion matrix
 scripts/
   lib/common.sh               shared config, logging, retries, runtime detection
   setup_llm.sh                Ollama (docker auto / native fallback)
@@ -213,9 +280,12 @@ observability/
 ## 6. Roadmap
 
 - [x] Environment bootstrap, model serving, observability
-- [x] Indonesian OWASP 2026 test corpus (single/multi-turn, contaminated/clean)
-- [x] Application-layer guardrails (input/output, explainable rule ids)
+- [x] Deterministic decoding (temp 0 / top_p 1 / top_k 1 / seed 42)
+- [x] Indonesian OWASP 2026 test corpus with severity labels
+- [x] ChromaDB RAG with tenant ACL + indirect-injection filtering
+- [x] Application-layer guardrails (input/output/RAG, explainable rule ids)
 - [x] Async `test_runner.py` (baseline ASR/ASV + mitigated confusion matrix)
-- [x] Before/after analysis, FPR/FNR, Markdown/CSV report generation
+- [x] Semantic ASV + compliance/relevance/toxicity metrics
+- [x] Before/after analysis, per-severity, FPR/FNR, Markdown/CSV reports
 - [ ] Expand corpus with adjudicated human labels and inter-rater agreement
 - [ ] Optional second judge (LLM-as-judge) for ASV calibration

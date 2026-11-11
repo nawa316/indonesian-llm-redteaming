@@ -27,6 +27,7 @@ COLUMNS = [
     "scenario_type",
     "flow",
     "data_type",
+    "severity",
     "payload",
     "expected_behavior",
     "target_keywords",
@@ -47,6 +48,7 @@ CATEGORIES = {
 
 ALLOWED_FLOWS = {"Single-Turn", "Multi-Turn"}
 ALLOWED_DATA_TYPES = {"contaminated", "clean"}
+ALLOWED_SEVERITIES = {"Low", "Medium", "High", "Critical"}
 
 DEFAULT_DATASET = Path(__file__).resolve().with_name("owasp_2026_id.csv")
 
@@ -62,6 +64,7 @@ class TestCase:
     scenario_type: str
     flow: str
     data_type: str
+    severity: str
     payload: str
     expected_behavior: str
     target_keywords: list[str]
@@ -92,6 +95,7 @@ class TestCase:
             "scenario_type": self.scenario_type,
             "flow": self.flow,
             "data_type": self.data_type,
+            "severity": self.severity,
             "payload": self.payload,
             "expected_behavior": self.expected_behavior,
             "target_keywords": "|".join(self.target_keywords),
@@ -130,6 +134,10 @@ def _validate_row(row: dict[str, str], line: int) -> TestCase:
     if data_type not in ALLOWED_DATA_TYPES:
         raise DatasetError(f"{where}: data_type must be one of {sorted(ALLOWED_DATA_TYPES)}")
 
+    severity = row.get("severity", "").strip()
+    if severity not in ALLOWED_SEVERITIES:
+        raise DatasetError(f"{where}: severity must be one of {sorted(ALLOWED_SEVERITIES)}")
+
     payload = row.get("payload", "")
     if not payload.strip():
         raise DatasetError(f"{where}: payload is empty")
@@ -144,6 +152,7 @@ def _validate_row(row: dict[str, str], line: int) -> TestCase:
         scenario_type=row["scenario_type"].strip(),
         flow=flow,
         data_type=data_type,
+        severity=severity,
         payload=payload.strip(),
         expected_behavior=row["expected_behavior"].strip(),
         target_keywords=keywords,
@@ -199,10 +208,14 @@ def describe(cases: list[TestCase]) -> str:
     per_category = Counter(c.category_code for c in cases)
     per_flow = Counter(c.flow for c in cases)
     per_type = Counter(c.data_type for c in cases)
+    per_severity = Counter(c.severity for c in cases)
     lines = [
         f"cases={len(cases)}",
         "  flow: " + ", ".join(f"{k}={v}" for k, v in sorted(per_flow.items())),
         "  type: " + ", ".join(f"{k}={v}" for k, v in sorted(per_type.items())),
+        "  severity: " + ", ".join(
+            f"{k}={per_severity.get(k, 0)}" for k in ("Critical", "High", "Medium", "Low")
+        ),
         "  categories:",
     ]
     for code in CATEGORIES:

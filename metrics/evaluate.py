@@ -1,20 +1,18 @@
 #!/usr/bin/env python3
 """Before/After evaluation for the thesis Chapter 3 metrics.
 
-Reads ``reports/baseline.csv`` and ``reports/mitigated.csv``, then produces:
+Reads ``reports/baseline.csv`` and ``reports/mitigated.csv`` and produces:
 
-* per-category and overall ASR / mean ASV, baseline vs mitigated
-* reduction deltas (percentage points for ASR, absolute for ASV)
-* confusion-matrix counts (TP / FP / TN / FN)
+* per-category, per-severity and overall ASR / mean ASV
+* complementary metrics: compliance, relevance, toxicity rate
+* reduction deltas (pp for ASR, absolute for ASV)
+* confusion matrix (TP / FP / TN / FN)
 * FPR = FP / (FP + TN) and FNR = FN / (FN + TP)
 
-Outputs ``reports/summary.csv`` and ``reports/summary.md`` and prints the
-Markdown table.
+Writes ``reports/summary.csv`` and ``reports/summary.md``.
 
 Usage:
     python metrics/evaluate.py
-    python metrics/evaluate.py --baseline reports/baseline.csv \
-        --mitigated reports/mitigated.csv --out reports
 """
 from __future__ import annotations
 
@@ -31,11 +29,13 @@ if str(ROOT) not in sys.path:
 from dataset.loader import CATEGORIES  # noqa: E402
 
 REQUIRED_COLUMNS = {
-    "test_id", "phase", "category", "data_type", "guardrail_blocked",
-    "exploit_success", "asv_score", "confusion_class",
+    "test_id", "phase", "category", "data_type", "severity",
+    "guardrail_blocked", "exploit_success", "asv_score",
+    "compliance_score", "relevance_score", "toxicity_flag", "confusion_class",
 }
 _TRUE = {"true", "1", "yes", "y", "t"}
 _FALSE = {"false", "0", "no", "n", "f"}
+SEVERITIES = ("Critical", "High", "Medium", "Low")
 
 
 def _as_bool(series: pd.Series) -> pd.Series:
@@ -62,13 +62,16 @@ def load_report(path: str | Path) -> pd.DataFrame:
     if missing:
         raise ValueError(f"{path}: missing columns {missing}")
 
-    for column in ("phase", "category", "data_type", "confusion_class"):
+    for column in ("phase", "category", "data_type", "severity", "confusion_class"):
         df[column] = df[column].astype(str).str.strip()
     df["data_type"] = df["data_type"].str.casefold()
+    df["severity"] = df["severity"].str.title()
     df["confusion_class"] = df["confusion_class"].str.upper()
     df["guardrail_blocked"] = _as_bool(df["guardrail_blocked"])
     df["exploit_success"] = _as_bool(df["exploit_success"])
-    df["asv_score"] = pd.to_numeric(df["asv_score"], errors="coerce").fillna(0.0).clip(0.0, 1.0)
+    df["toxicity_flag"] = _as_bool(df["toxicity_flag"])
+    for column in ("asv_score", "compliance_score", "relevance_score"):
+        df[column] = pd.to_numeric(df[column], errors="coerce").fillna(0.0).clip(0.0, 1.0)
     return df
 
 
@@ -77,78 +80,96 @@ def _rate(numerator: int, denominator: int) -> float:
 
 
 def compute_scope(df: pd.DataFrame) -> dict[str, float | int]:
-    """Compute metrics for one subset (overall or a single category)."""
     contaminated = df[df["data_type"] == "contaminated"]
     clean = df[df["data_type"] == "clean"]
-
     n_contaminated = len(contaminated)
-    asr = 100.0 * contaminated["exploit_success"].mean() if n_contaminated else float("nan")
-    asv = contaminated["asv_score"].mean() if n_contaminated else float("nan")
+
+    def mean(column: str) -> float:
+        return float(contaminated[column].mean()) if n_contaminated else float("nan")
 
     tp = int((df["confusion_class"] == "TP").sum())
     fp = int((df["confusion_class"] == "FP").sum())
     tn = int((df["confusion_class"] == "TN").sum())
     fn = int((df["confusion_class"] == "FN").sum())
 
-    fpr = _rate(fp, fp + tn)
-    fnr = _rate(fn, fn + tp)
-
     return {
         "n": n_contaminated,
         "n_clean": len(clean),
-        "asr": asr,
-        "asv": asv,
+        "asr": (100.0 * float(contaminated["exploit_success"].mean())) if n_contaminated else float("nan"),
+        "asv": mean("asv_score"),
+        "compliance": mean("compliance_score"),
+        "relevance": mean("relevance_score"),
+        "toxicity": (100.0 * float(contaminated["toxicity_flag"].mean())) if n_contaminated else float("nan"),
         "tp": tp,
         "fp": fp,
         "tn": tn,
         "fn": fn,
-        "fpr": fpr,
-        "fnr": fnr,
+        "fpr": _rate(fp, fp + tn),
+        "fnr": _rate(fn, fn + tp),
     }
 
 
+def _select(df: pd.DataFrame, kind: str, value: str) -> pd.DataFrame:
+    if kind == "all":
+        return df
+    if kind == "category":
+        return df[df["category"] == value]
+    if kind == "severity":
+        return df[df["severity"] == value]
+    raise ValueError(kind)
+
+
 def summarize(baseline: pd.DataFrame, mitigated: pd.DataFrame | None) -> pd.DataFrame:
-    """Build the comparison table, one row per scope (overall first)."""
-    scopes: list[tuple[str, str]] = [("Overall", "__ALL__")]
-    present = set(baseline["category"]) | (set(mitigated["category"]) if mitigated is not None else set())
+    scopes: list[tuple[str, str, str]] = [("Overall", "all", "__ALL__")]
+
+    present_categories = set(baseline["category"])
+    if mitigated is not None:
+        present_categories |= set(mitigated["category"])
     for code, title in CATEGORIES.items():
         label = f"{code}: {title}"
-        if label in present:
-            scopes.append((code, label))
+        if label in present_categories:
+            scopes.append((code, "category", label))
+
+    present_severities = set(baseline.loc[baseline["data_type"] == "contaminated", "severity"])
+    if mitigated is not None:
+        present_severities |= set(
+            mitigated.loc[mitigated["data_type"] == "contaminated", "severity"]
+        )
+    for severity in SEVERITIES:
+        if severity in present_severities:
+            scopes.append((f"Severity: {severity}", "severity", severity))
 
     rows: list[dict[str, object]] = []
-    for scope, selector in scopes:
-        base_df = baseline if selector == "__ALL__" else baseline[baseline["category"] == selector]
-        base = compute_scope(base_df)
+    for label, kind, value in scopes:
+        base = compute_scope(_select(baseline, kind, value))
 
         if mitigated is not None:
-            mit_df = mitigated if selector == "__ALL__" else mitigated[mitigated["category"] == selector]
-            mit = compute_scope(mit_df)
+            mit = compute_scope(_select(mitigated, kind, value))
         else:
-            mit = {k: float("nan") for k in ("asr", "asv", "fpr", "fnr")}
+            mit = {k: float("nan") for k in ("asr", "asv", "compliance", "relevance", "toxicity", "fpr", "fnr")}
             mit.update({"n": 0, "n_clean": 0, "tp": 0, "fp": 0, "tn": 0, "fn": 0})
 
-        asr_delta = (
-            base["asr"] - mit["asr"]
-            if pd.notna(base["asr"]) and pd.notna(mit["asr"])
-            else float("nan")
-        )
-        asv_delta = (
-            base["asv"] - mit["asv"]
-            if pd.notna(base["asv"]) and pd.notna(mit["asv"])
-            else float("nan")
-        )
+        def delta(key: str) -> float:
+            if pd.notna(base[key]) and pd.notna(mit[key]):
+                return float(base[key]) - float(mit[key])
+            return float("nan")
 
         rows.append({
-            "scope": scope,
+            "scope": label,
             "baseline_n": base["n"],
             "baseline_asr_pct": base["asr"],
             "baseline_asv": base["asv"],
+            "baseline_compliance": base["compliance"],
+            "baseline_relevance": base["relevance"],
+            "baseline_toxicity_pct": base["toxicity"],
             "mitigated_n": mit["n"],
             "mitigated_asr_pct": mit["asr"],
             "mitigated_asv": mit["asv"],
-            "asr_reduction_pp": asr_delta,
-            "asv_reduction": asv_delta,
+            "mitigated_compliance": mit["compliance"],
+            "mitigated_relevance": mit["relevance"],
+            "mitigated_toxicity_pct": mit["toxicity"],
+            "asr_reduction_pp": delta("asr"),
+            "asv_reduction": delta("asv"),
             "tp": mit["tp"],
             "fp": mit["fp"],
             "tn": mit["tn"],
@@ -163,17 +184,10 @@ def summarize(baseline: pd.DataFrame, mitigated: pd.DataFrame | None) -> pd.Data
 def _fmt(value: object, digits: int = 1) -> str:
     if value is None or (isinstance(value, float) and pd.isna(value)):
         return "—"
-    if isinstance(value, (int,)):
-        return str(value)
     return f"{float(value):.{digits}f}"
 
 
 def render_markdown(table: pd.DataFrame, *, baseline_path: str, mitigated_path: str | None) -> str:
-    header = (
-        "| Scope | Base ASR % | Base ASV | Mitig. ASR % | Mitig. ASV | ΔASR (pp) | ΔASV "
-        "| TP | FP | TN | FN | FPR % | FNR % |\n"
-        "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|"
-    )
     lines = [
         "# Before / After Security Evaluation",
         "",
@@ -182,19 +196,43 @@ def render_markdown(table: pd.DataFrame, *, baseline_path: str, mitigated_path: 
         "",
         "Positive Δ means improvement (baseline minus mitigated).",
         "",
-        header,
+        "## Attack success",
+        "",
+        "| Scope | Base ASR % | Base ASV | Mitig. ASR % | Mitig. ASV | ΔASR (pp) | ΔASV |",
+        "|---|---:|---:|---:|---:|---:|---:|",
     ]
     for _, row in table.iterrows():
         lines.append(
-            "| {scope} | {b_asr} | {b_asv} | {m_asr} | {m_asv} | {d_asr} | {d_asv} "
+            "| {scope} | {basr} | {basv} | {masr} | {masv} | {dasr} | {dasv} |".format(
+                scope=row["scope"],
+                basr=_fmt(row["baseline_asr_pct"]),
+                basv=_fmt(row["baseline_asv"], 3),
+                masr=_fmt(row["mitigated_asr_pct"]),
+                masv=_fmt(row["mitigated_asv"], 3),
+                dasr=_fmt(row["asr_reduction_pp"]),
+                dasv=_fmt(row["asv_reduction"], 3),
+            )
+        )
+
+    lines += [
+        "",
+        "## Complementary metrics and confusion matrix",
+        "",
+        "| Scope | Base Comply | Base Relev | Base Toxic % | Mitig. Comply | Mitig. Relev "
+        "| Mitig. Toxic % | TP | FP | TN | FN | FPR % | FNR % |",
+        "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
+    ]
+    for _, row in table.iterrows():
+        lines.append(
+            "| {scope} | {bc} | {br} | {bt} | {mc} | {mr} | {mt} "
             "| {tp} | {fp} | {tn} | {fn} | {fpr} | {fnr} |".format(
                 scope=row["scope"],
-                b_asr=_fmt(row["baseline_asr_pct"]),
-                b_asv=_fmt(row["baseline_asv"], 3),
-                m_asr=_fmt(row["mitigated_asr_pct"]),
-                m_asv=_fmt(row["mitigated_asv"], 3),
-                d_asr=_fmt(row["asr_reduction_pp"]),
-                d_asv=_fmt(row["asv_reduction"], 3),
+                bc=_fmt(row["baseline_compliance"], 3),
+                br=_fmt(row["baseline_relevance"], 3),
+                bt=_fmt(row["baseline_toxicity_pct"]),
+                mc=_fmt(row["mitigated_compliance"], 3),
+                mr=_fmt(row["mitigated_relevance"], 3),
+                mt=_fmt(row["mitigated_toxicity_pct"]),
                 tp=int(row["tp"]),
                 fp=int(row["fp"]),
                 tn=int(row["tn"]),
