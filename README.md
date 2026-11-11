@@ -191,6 +191,48 @@ RAG activates automatically for `LLM09`/vector cases, or globally:
 python test_runner.py --phase baseline --use-rag
 ```
 
+### Client-server split (Figure 3.2)
+
+`app_server.py` hosts the **Controlled Testbed**: guardrails, ChromaDB RAG and
+Ollama. The runner then only needs network access, no GPU or local models.
+
+```
+Test Client (laptop)                         Controlled Testbed (Runpod)
+┌───────────────────────┐   HTTP/JSON       ┌──────────────────────────────┐
+│ test_runner.py        │ ────────────────► │ app_server.py :8000          │
+│ judge + Telemetry     │ ◄──────────────── │ guardrails → RAG → Ollama    │
+│ reports/*.jsonl|csv   │                   │ ChromaDB + Llama-Sahabat 70B │
+└───────────────────────┘                   └──────────────────────────────┘
+```
+
+Start the server on the pod (also included in `./setup.sh all`):
+
+```bash
+./setup.sh app            # background on 0.0.0.0:8000, logs to /workspace/logs
+curl -s localhost:8000/health | python3 -m json.tool
+```
+
+Expose port `8000` to the client, either with an SSH tunnel
+
+```bash
+ssh -N -L 8000:127.0.0.1:8000 root@<pod-host> -p <port>
+```
+
+or via **Runpod → Connect → HTTP Service** for port `8000`.
+
+Then run the campaign from the laptop; no local Chroma or Ollama is imported:
+
+```bash
+python test_runner.py --app-url http://127.0.0.1:8000 --phase baseline
+python test_runner.py --app-url http://127.0.0.1:8000 --phase mitigated
+python metrics/evaluate.py
+```
+
+`APP_BASE_URL` in `.env` enables the same behaviour without the flag
+(`RUNNER_MODE=auto`). Use `--mode direct` to force the original in-process
+execution on a single machine. In remote mode telemetry also stores
+`server_latency_ms`, `rag_metadata` and the raw model response.
+
 ### Guardrails (application layer)
 
 | Module | Purpose |
@@ -235,8 +277,8 @@ Outputs: `reports/{baseline,mitigated}.jsonl`, `.csv`, and `reports/summary.csv`
 TP/FP/TN/FN, FPR and FNR per category, per severity and overall.
 
 Useful flags: `--limit`, `--test-id LLM01-001`, `--concurrency`, `--output`,
-`--use-rag`, `--rag-top-k`, `--temperature`, `--seed`, `--num-predict`,
-`--system-prompt`.
+`--app-url`, `--mode {auto,direct,remote}`, `--use-rag`, `--rag-top-k`,
+`--temperature`, `--seed`, `--num-predict`, `--system-prompt`.
 
 ---
 
@@ -244,7 +286,8 @@ Useful flags: `--limit`, `--test-id LLM01-001`, `--concurrency`, `--output`,
 
 ```
 setup.sh                      single entry point
-test_runner.py                async baseline/mitigated campaign runner
+app_server.py                 Controlled Testbed FastAPI server (:8000)
+test_runner.py                async client (direct or --app-url remote)
 dataset/
   owasp_2026_id.csv           Indonesian OWASP 2026 corpus (+ severity)
   rag_documents_id.json       public / confidential / poisoned RAG docs
@@ -265,6 +308,7 @@ scripts/
   setup_llm.sh                Ollama (docker auto / native fallback)
   setup_model.sh              HF download + Modelfile render + ollama create
   setup_observability.sh      exporter (+ optional Prometheus/Grafana)
+  setup_app.sh                application server on :8000 (background)
   verify_stack.sh             readiness + inference smoke test
 config/Modelfile.template     Llama 3.1 chat template + generation params
 observability/
@@ -283,6 +327,7 @@ observability/
 - [x] Deterministic decoding (temp 0 / top_p 1 / top_k 1 / seed 42)
 - [x] Indonesian OWASP 2026 test corpus with severity labels
 - [x] ChromaDB RAG with tenant ACL + indirect-injection filtering
+- [x] Client-server split (app_server :8000 ↔ remote test_runner)
 - [x] Application-layer guardrails (input/output/RAG, explainable rule ids)
 - [x] Async `test_runner.py` (baseline ASR/ASV + mitigated confusion matrix)
 - [x] Semantic ASV + compliance/relevance/toxicity metrics

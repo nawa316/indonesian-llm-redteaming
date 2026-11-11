@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import json
 import os
 import sys
 import time
@@ -76,6 +77,8 @@ DEFAULT_REPEAT_PENALTY = float(os.getenv("REPEAT_PENALTY", "1.1"))
 DEFAULT_NUM_CTX = int(os.getenv("NUM_CTX", "8192"))
 DEFAULT_NUM_PREDICT = int(os.getenv("NUM_PREDICT", "512"))
 DEFAULT_RAG_TOP_K = int(os.getenv("RAG_TOP_K", "4"))
+DEFAULT_APP_URL = os.getenv("APP_BASE_URL", "")
+DEFAULT_RUNNER_MODE = os.getenv("RUNNER_MODE", "auto")
 
 
 def needs_rag(case: TestCase) -> bool:
@@ -113,11 +116,14 @@ class TestRunner:
         system_prompt: str = DEFAULT_SYSTEM_PROMPT,
         guardrails: GuardrailPipeline | None = None,
         use_rag: bool = False,
+        app_url: str = "",
         append: bool = False,
         verbose: bool = True,
     ) -> None:
         self.phase = phase
         self.base_url = base_url.rstrip("/")
+        self.app_url = app_url.rstrip("/")
+        self.remote = bool(self.app_url)
         self.model = model
         self.output_dir = output_dir
         self.output_dir.mkdir(parents=True, exist_ok=True)
@@ -131,7 +137,7 @@ class TestRunner:
         self.num_ctx = num_ctx
         self.num_predict = num_predict
         self.system_prompt = system_prompt
-        self.pipeline = guardrails or GuardrailPipeline()
+        self.pipeline = guardrails or (None if self.remote else GuardrailPipeline())
         self.use_rag = use_rag
         self.append = append
         self.verbose = verbose
@@ -189,6 +195,39 @@ class TestRunner:
                 f"{type(exc).__name__}: {exc}",
             )
 
+    # -- remote application server -----------------------------------------
+    async def _chat_remote(
+        self,
+        client: httpx.AsyncClient,
+        messages: list[dict[str, str]],
+        use_rag: bool,
+    ) -> tuple[int | None, dict[str, Any] | None, str | None]:
+        body = {
+            "phase": self.phase,
+            "messages": messages,
+            "use_rag": bool(use_rag),
+            "options": {
+                "temperature": self.temperature,
+                "top_p": self.top_p,
+                "top_k": self.top_k,
+                "seed": self.seed,
+                "repeat_penalty": self.repeat_penalty,
+                "num_ctx": self.num_ctx,
+                "num_predict": self.num_predict,
+            },
+        }
+        try:
+            response = await client.post(f"{self.app_url}/api/app/chat", json=body)
+            if response.status_code != 200:
+                return (
+                    response.status_code,
+                    None,
+                    f"HTTP {response.status_code}: {response.text[:300]}",
+                )
+            return response.status_code, response.json(), None
+        except (httpx.HTTPError, ValueError) as exc:
+            return None, None, f"{type(exc).__name__}: {exc}"
+
     # -- one case ----------------------------------------------------------
     def _base_event(self, case: TestCase, *, turn_count: int) -> TelemetryEvent:
         return TelemetryEvent(
@@ -209,6 +248,8 @@ class TestRunner:
         )
 
     async def run_case(self, client: httpx.AsyncClient, case: TestCase) -> TelemetryEvent:
+        if self.remote:
+            return await self._run_case_remote(client, case)
         async with self._semaphore:
             started = time.perf_counter()
             turns = case.turns
@@ -349,6 +390,120 @@ class TestRunner:
             })
             return event
 
+    async def _run_case_remote(
+        self, client: httpx.AsyncClient, case: TestCase
+    ) -> TelemetryEvent:
+        """Run one case against the Controlled Testbed application server."""
+        async with self._semaphore:
+            started = time.perf_counter()
+            turns = case.turns
+            event = self._base_event(case, turn_count=len(turns))
+            event.metadata["execution_mode"] = "remote"
+            event.metadata["app_url"] = self.app_url
+
+            rag_active = self.use_rag or needs_rag(case)
+            messages: list[dict[str, str]] = []
+            responses: list[str] = []
+            raw_responses: list[str] = []
+            blocked_response = ""
+
+            blocked = False
+            block_stage = ""
+            block_reason = ""
+            block_rule = ""
+            status_code: int | None = None
+            prompt_tokens = 0
+            completion_tokens = 0
+            server_latency_ms = 0.0
+            rag_metadata: dict[str, Any] = {}
+            transport_error: str | None = None
+
+            for turn in turns:
+                messages.append({"role": "user", "content": turn})
+                status, data, error = await self._chat_remote(client, messages, rag_active)
+                status_code = status
+                if error or data is None:
+                    transport_error = error or "empty response"
+                    break
+
+                server_latency_ms += float(data.get("server_latency_ms") or 0.0)
+                if data.get("rag_metadata"):
+                    rag_metadata = dict(data["rag_metadata"])
+                prompt_tokens += int(data.get("prompt_tokens") or 0)
+                completion_tokens += int(data.get("completion_tokens") or 0)
+
+                if data.get("guardrail_blocked"):
+                    blocked = True
+                    block_stage = str(data.get("block_stage") or "input")
+                    block_reason = str(data.get("guardrail_reason") or "")
+                    block_rule = str(data.get("rule_id") or "")
+                    blocked_response = str(data.get("response") or "")
+                    raw = str(data.get("raw_response") or "")
+                    if raw:
+                        raw_responses.append(raw)
+                    break
+
+                content = str(data.get("response") or "")
+                responses.append(content)
+                raw_responses.append(str(data.get("raw_response") or content))
+                messages.append({"role": "assistant", "content": content})
+
+            combined_response = (
+                blocked_response if blocked and blocked_response else "\n".join(responses)
+            ).strip()
+
+            exploit_success = False
+            asv_score = 0.0
+            compliance_score = 1.0
+            relevance_score = 0.0
+            toxicity_flag = False
+            verdict: dict[str, Any] | None = None
+
+            if not transport_error and not blocked and combined_response:
+                judged = judge_response(
+                    combined_response,
+                    case.target_keywords if case.data_type == "contaminated" else [],
+                    expected_behavior=case.expected_behavior,
+                    prompt=" ".join(turns),
+                )
+                verdict = judged.to_dict()
+                compliance_score = judged.compliance_score
+                relevance_score = judged.relevance_score
+                toxicity_flag = judged.toxicity_flag
+                if case.data_type == "contaminated":
+                    exploit_success = judged.exploit_success
+                    asv_score = judged.asv_score
+
+            event.guardrail_blocked = blocked
+            event.guardrail_reason = (
+                f"{block_stage}:{block_reason}" if blocked else ""
+            )
+            event.exploit_success = exploit_success
+            event.asv_score = asv_score
+            event.compliance_score = compliance_score
+            event.relevance_score = relevance_score
+            event.toxicity_flag = toxicity_flag
+            event.confusion_class = classify(case.data_type, self.phase, blocked)
+            event.status_code = status_code
+            event.latency_ms = round((time.perf_counter() - started) * 1000, 3)
+            event.response = combined_response
+            event.prompt_tokens = prompt_tokens or None
+            event.completion_tokens = completion_tokens or None
+            event.success = transport_error is None
+            event.error = transport_error
+            event.metadata.update({
+                "guardrail_stage": block_stage,
+                "guardrail_rule": block_rule,
+                "turn_responses": responses,
+                "raw_response": "\n".join(raw_responses),
+                "server_latency_ms": round(server_latency_ms, 3),
+                "rag": rag_metadata,
+                "rag_doc_ids": rag_metadata.get("retrieved_doc_ids", []),
+                "rag_dropped": rag_metadata.get("dropped_docs", []),
+                "judge": verdict,
+            })
+            return event
+
     # -- campaign ----------------------------------------------------------
     async def run(self, cases: list[TestCase]) -> tuple[Path, Path]:
         jsonl_path = self.output_dir / f"{self.phase}.jsonl"
@@ -441,6 +596,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--output", default=str(ROOT / "reports"))
     parser.add_argument("--concurrency", type=int, default=1)
     parser.add_argument("--base-url", default=DEFAULT_BASE_URL)
+    parser.add_argument("--app-url", default=DEFAULT_APP_URL, help="remote app_server base URL")
+    parser.add_argument(
+        "--mode",
+        choices=["auto", "direct", "remote"],
+        default=DEFAULT_RUNNER_MODE,
+        help="auto uses --app-url/APP_BASE_URL when present",
+    )
     parser.add_argument("--model", default=DEFAULT_MODEL)
     parser.add_argument("--timeout", type=float, default=600.0)
     parser.add_argument("--temperature", type=float, default=DEFAULT_TEMPERATURE)
@@ -476,11 +638,38 @@ async def amain(args: argparse.Namespace) -> int:
         print("no test cases selected", file=sys.stderr)
         return 2
 
+    app_url = (args.app_url or os.getenv("APP_BASE_URL", "")).rstrip("/")
+    remote = args.mode == "remote" or (args.mode == "auto" and bool(app_url))
+    if remote and not app_url:
+        print("remote mode requires --app-url or APP_BASE_URL", file=sys.stderr)
+        return 2
+
+    if remote:
+        try:
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                health = await client.get(f"{app_url}/health")
+                health.raise_for_status()
+                info = health.json()
+        except (httpx.HTTPError, ValueError) as exc:
+            print(f"cannot reach application server at {app_url}: {exc}", file=sys.stderr)
+            return 1
+        print(
+            f"remote app_server: status={info.get('status')} "
+            f"ollama={info.get('ollama')} model={info.get('model')} "
+            f"chroma_docs={info.get('chroma_docs')}",
+            file=sys.stderr,
+        )
+        if not info.get("model_available", True):
+            print("WARNING: configured model is not listed by Ollama", file=sys.stderr)
+
     rag_filter = None
     rag_requested = (
-        args.use_rag
-        or os.getenv("USE_RAG", "0") == "1"
-        or any(needs_rag(case) for case in cases)
+        not remote
+        and (
+            args.use_rag
+            or os.getenv("USE_RAG", "0") == "1"
+            or any(needs_rag(case) for case in cases)
+        )
     )
     if rag_requested:
         from guardrails.rag_filter import RAGFilter
@@ -501,7 +690,7 @@ async def amain(args: argparse.Namespace) -> int:
             file=sys.stderr,
         )
 
-    guardrails = GuardrailPipeline(rag_filter=rag_filter)
+    guardrails = None if remote else GuardrailPipeline(rag_filter=rag_filter)
 
     runner = TestRunner(
         phase=args.phase,
@@ -520,6 +709,7 @@ async def amain(args: argparse.Namespace) -> int:
         system_prompt=args.system_prompt,
         guardrails=guardrails,
         use_rag=args.use_rag,
+        app_url=app_url if remote else "",
         append=args.append,
         verbose=not args.quiet,
     )
