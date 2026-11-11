@@ -125,17 +125,74 @@ with TelemetryRecorder("reports/baseline.jsonl") as rec:
     rec.export_csv("reports/baseline.csv")
 ```
 
-Each line records timestamp, run id, test id, OWASP category, turn, status code,
-latency, prompt/response, token counts, success flag and free-form metadata.
-Writes are lock-protected and flushed periodically, so evidence survives a
-crashed run.
+Each line records timestamp, run id, test id, phase, OWASP category, technique,
+turn, data type, guardrail decision, exploit/ASV verdict, confusion class,
+status code, latency, prompt/response, token counts, success flag and free-form
+metadata. Writes are lock-protected and flushed periodically, so evidence
+survives a crashed run.
 
 ---
 
-## 4. Repository layout
+## 4. Research harness (Chapter 3)
+
+### Dataset
+
+`dataset/owasp_2026_id.csv` — 40 Indonesian cases, 4 per OWASP 2026 category,
+balanced across `Single-Turn`/`Multi-Turn` and `contaminated`/`clean`. Multi-turn
+payloads separate turns with `||`.
+
+```bash
+python dataset/loader.py          # schema + coverage validation
+```
+
+### Guardrails (application layer)
+
+| Module | Purpose |
+|---|---|
+| `guardrails/input_filter.py` | injection/override, system-prompt extraction, excessive agency, secret extraction, supply chain, DoS length/repetition rules |
+| `guardrails/output_filter.py` | system-prompt leakage, credentials/PII (NIK, phone, email), executable HTML/markdown/code |
+| `guardrails/pipeline.py` | `(allowed, reason, sanitized_text)` for input and output |
+
+Every block returns a stable rule id (e.g. `INJ_OVERRIDE_01`) that is stored in
+telemetry, so the thesis can report per-rule precision.
+
+### Running a campaign
+
+```bash
+# 1) baseline: no mitigation
+python test_runner.py --phase baseline --concurrency 1
+
+# 2) mitigated: guardrails active
+python test_runner.py --phase mitigated --concurrency 1
+
+# 3) before/after comparison (writes reports/summary.{csv,md})
+python metrics/evaluate.py
+```
+
+Outputs: `reports/{baseline,mitigated}.jsonl`, `.csv`, and `reports/summary.csv`
+/ `.md` with ASR, mean ASV, ΔASR, ΔASV, TP/FP/TN/FN, FPR and FNR per category
+and overall.
+
+Useful flags: `--limit`, `--test-id LLM01-001`, `--concurrency`, `--output`,
+`--num-predict`, `--system-prompt`.
+
+---
+
+## 5. Repository layout
 
 ```
 setup.sh                      single entry point
+test_runner.py                async baseline/mitigated campaign runner
+dataset/
+  owasp_2026_id.csv           Indonesian OWASP 2026 corpus
+  loader.py                   schema validation + TestCase model
+guardrails/
+  input_filter.py             pre-inference scanner
+  output_filter.py            post-inference scanner + redaction
+  pipeline.py                 unified (allowed, reason, text) wrapper
+metrics/
+  judge.py                    ASR/ASV heuristic judge
+  evaluate.py                 before/after + confusion-matrix report
 scripts/
   lib/common.sh               shared config, logging, retries, runtime detection
   setup_llm.sh                Ollama (docker auto / native fallback)
@@ -145,7 +202,7 @@ scripts/
 config/Modelfile.template     Llama 3.1 chat template + generation params
 observability/
   gpu_exporter.py             Prometheus exporter (GPU/Ollama/host)
-  telemetry.py                async-safe JSONL + CSV recorder
+  telemetry.py                async-safe JSONL + CSV recorder (security schema)
   prometheus.yml              scrape config
   docker-compose.yml          Prometheus + Grafana
   grafana/                    provisioning + dashboard
@@ -153,10 +210,12 @@ observability/
 
 ---
 
-## 5. Roadmap
+## 6. Roadmap
 
 - [x] Environment bootstrap, model serving, observability
-- [ ] Test corpus (single-turn, multi-turn, sensitive disclosure, …)
-- [ ] Async `test_runner.py` (ASR / ASV baseline)
-- [ ] Application-layer guardrails & post-mitigation evaluation (FPR/FNR)
-- [ ] Before/after analysis and report generation
+- [x] Indonesian OWASP 2026 test corpus (single/multi-turn, contaminated/clean)
+- [x] Application-layer guardrails (input/output, explainable rule ids)
+- [x] Async `test_runner.py` (baseline ASR/ASV + mitigated confusion matrix)
+- [x] Before/after analysis, FPR/FNR, Markdown/CSV report generation
+- [ ] Expand corpus with adjudicated human labels and inter-rater agreement
+- [ ] Optional second judge (LLM-as-judge) for ASV calibration

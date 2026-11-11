@@ -9,9 +9,16 @@ Schema (JSONL)
 ts_utc            ISO-8601 UTC timestamp
 run_id            UUID shared by all events of one campaign
 test_id           stable identifier of the test case
+phase             "baseline" | "mitigated"
 category          OWASP LLM Top-10 2026 category (e.g. LLM01)
 technique         e.g. single_turn | multi_turn
-turn              turn index inside a conversation (0-based)
+turn              number of turns executed in the conversation
+data_type         "contaminated" (attack) | "clean" (benign, for FPR)
+guardrail_blocked bool: intercepted by an application-layer guardrail
+guardrail_reason  rule/pattern id that triggered the block
+exploit_success   bool: model complied with the malicious payload (ASR numerator)
+asv_score         0.0-1.0 Attack Success Value (degree of malicious compliance)
+confusion_class   "TP" | "FN" | "TN" | "FP" | "N/A" (baseline)
 status_code       HTTP status returned by the target API
 latency_ms        wall-clock latency of the request
 model             served model name
@@ -21,7 +28,7 @@ prompt_tokens     tokens reported by Ollama (if any)
 completion_tokens tokens reported by Ollama (if any)
 success           bool: request completed without transport error
 error             error string when success is false
-metadata          free-form dict (mitigation flags, judge scores, ...)
+metadata          free-form dict (per-turn responses, matched keywords, ...)
 """
 from __future__ import annotations
 
@@ -45,9 +52,16 @@ def utc_now() -> str:
 @dataclass
 class TelemetryEvent:
     test_id: str
+    phase: str = "baseline"
     category: str = ""
     technique: str = ""
     turn: int = 0
+    data_type: str = "contaminated"
+    guardrail_blocked: bool = False
+    guardrail_reason: str = ""
+    exploit_success: bool = False
+    asv_score: float = 0.0
+    confusion_class: str = "N/A"
     status_code: int | None = None
     latency_ms: float | None = None
     model: str = ""
@@ -78,18 +92,26 @@ class TelemetryRecorder:
     """
 
     FIELDS = [
-        "ts_utc", "run_id", "test_id", "category", "technique", "turn",
-        "status_code", "latency_ms", "model", "prompt", "response",
-        "prompt_tokens", "completion_tokens", "success", "error", "metadata",
+        "ts_utc", "run_id", "test_id", "phase", "category", "technique",
+        "turn", "data_type", "guardrail_blocked", "guardrail_reason",
+        "exploit_success", "asv_score", "confusion_class", "status_code",
+        "latency_ms", "model", "prompt", "response", "prompt_tokens",
+        "completion_tokens", "success", "error", "metadata",
     ]
 
-    def __init__(self, path: str | os.PathLike[str], *, flush_every: int = 10) -> None:
+    def __init__(
+        self,
+        path: str | os.PathLike[str],
+        *,
+        flush_every: int = 10,
+        append: bool = True,
+    ) -> None:
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.run_id = str(uuid.uuid4())
         self.flush_every = max(1, flush_every)
         self._lock = threading.Lock()
-        self._fh = self.path.open("a", encoding="utf-8", newline="\n")
+        self._fh = self.path.open("a" if append else "w", encoding="utf-8", newline="\n")
         self._count = 0
 
     # -- context manager ---------------------------------------------------

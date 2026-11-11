@@ -3,8 +3,16 @@
 logs/
 reports/
 models/
+
+# Telemetry/evidence output is generated, never committed...
 *.jsonl
 *.csv
+
+# ...except the curated research corpus, which must be versioned.
+!dataset/
+!dataset/*.csv
+!dataset/*.jsonl
+
 !reports/.gitkeep
 
 # Python
