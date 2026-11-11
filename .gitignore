@@ -1,0 +1,24 @@
+# Runtime artefacts
+.runtime/
+logs/
+reports/
+models/
+*.jsonl
+*.csv
+!reports/.gitkeep
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+
+# Secrets / local config
+.env
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/

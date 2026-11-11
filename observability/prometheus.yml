@@ -1,0 +1,12 @@
+global:
+  scrape_interval: 5s
+  evaluation_interval: 15s
+
+scrape_configs:
+  - job_name: llm-exporter
+    static_configs:
+      # The exporter runs on the host. Docker Desktop resolves
+      # host.docker.internal automatically; on Linux add
+      #   extra_hosts: ["host.docker.internal:host-gateway"]
+      # to the prometheus service, or point this at the host IP.
+      - targets: ["host.docker.internal:9101"]
