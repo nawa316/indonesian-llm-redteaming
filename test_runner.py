@@ -27,12 +27,16 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+from contextlib import contextmanager
 import json
 import os
+import shutil
+import socket
+import subprocess
 import sys
 import time
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
 
 import httpx
 
@@ -79,6 +83,112 @@ DEFAULT_NUM_PREDICT = int(os.getenv("NUM_PREDICT", "512"))
 DEFAULT_RAG_TOP_K = int(os.getenv("RAG_TOP_K", "4"))
 DEFAULT_APP_URL = os.getenv("APP_BASE_URL", "")
 DEFAULT_RUNNER_MODE = os.getenv("RUNNER_MODE", "auto")
+DEFAULT_SSH_HOST = os.getenv("SSH_HOST", "")
+DEFAULT_SSH_PORT = int(os.getenv("SSH_PORT", "22"))
+DEFAULT_SSH_USER = os.getenv("SSH_USER", "root")
+DEFAULT_SSH_KEY = os.getenv("SSH_KEY", "")
+DEFAULT_REMOTE_APP_PORT = int(os.getenv("APP_PORT", "8000"))
+
+
+def parse_ssh_target(
+    ssh_spec: str,
+    default_user: str,
+    default_host: str,
+    default_port: int,
+) -> tuple[str, str, int]:
+    """Parse ``[user@]host[:port]`` or fall back to explicit user/host/port flags."""
+    user, host, port = default_user, default_host, default_port
+    spec = (ssh_spec or "").strip()
+    if spec:
+        if "@" in spec:
+            user_part, spec = spec.split("@", 1)
+            if user_part.strip():
+                user = user_part.strip()
+        if ":" in spec:
+            host_part, port_part = spec.rsplit(":", 1)
+            host = host_part.strip()
+            port = int(port_part.strip())
+        else:
+            host = spec.strip()
+    return user, host, port
+
+
+def _pick_local_port(preferred: int = 8000) -> int:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        try:
+            sock.bind(("127.0.0.1", preferred))
+            return preferred
+        except OSError:
+            sock.bind(("127.0.0.1", 0))
+            return int(sock.getsockname()[1])
+
+
+@contextmanager
+def open_ssh_tunnel(
+    *,
+    user: str,
+    host: str,
+    port: int = 22,
+    remote_port: int = 8000,
+    identity_file: str = "",
+) -> Iterator[str]:
+    """Open a background SSH local port-forward and yield ``http://127.0.0.1:<port>``."""
+    ssh_bin = shutil.which("ssh")
+    if not ssh_bin:
+        raise RuntimeError("OpenSSH client ('ssh') not found in PATH")
+
+    local_port = _pick_local_port(remote_port)
+    cmd = [
+        ssh_bin,
+        "-N",
+        "-L",
+        f"127.0.0.1:{local_port}:127.0.0.1:{remote_port}",
+        "-p",
+        str(port),
+        "-o",
+        "ExitOnForwardFailure=yes",
+        "-o",
+        "ServerAliveInterval=30",
+        "-o",
+        "ServerAliveCountMax=3",
+        "-o",
+        "StrictHostKeyChecking=accept-new",
+    ]
+    if identity_file:
+        cmd.extend(["-i", identity_file])
+    cmd.append(f"{user}@{host}")
+
+    print(
+        f"opening SSH tunnel: 127.0.0.1:{local_port} -> {user}@{host}:{port} "
+        f"(remote :{remote_port})",
+        file=sys.stderr,
+        flush=True,
+    )
+    proc = subprocess.Popen(cmd)
+    try:
+        deadline = time.monotonic() + 30.0
+        while time.monotonic() < deadline:
+            if proc.poll() is not None:
+                raise RuntimeError(
+                    f"ssh tunnel exited early with code {proc.returncode}"
+                )
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+                probe.settimeout(1.0)
+                if probe.connect_ex(("127.0.0.1", local_port)) == 0:
+                    break
+            time.sleep(0.3)
+        else:
+            raise RuntimeError("timed out waiting for local SSH tunnel port to open")
+
+        yield f"http://127.0.0.1:{local_port}"
+    finally:
+        if proc.poll() is None:
+            proc.terminate()
+            try:
+                proc.wait(timeout=5.0)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+        print("SSH tunnel closed.", file=sys.stderr, flush=True)
 
 
 def needs_rag(case: TestCase) -> bool:
@@ -586,6 +696,12 @@ class TestRunner:
         summary_csv = self.output_dir / f"summary_{self.phase}.csv"
         table.to_csv(summary_csv, index=False, float_format="%.3f")
         print(f"summary -> {summary_csv}")
+        if self.phase == "mitigated" and baseline_path.exists():
+            full_csv = self.output_dir / "summary.csv"
+            full_md = self.output_dir / "summary.md"
+            table.to_csv(full_csv, index=False, float_format="%.3f")
+            full_md.write_text(markdown, encoding="utf-8")
+            print(f"before/after summary -> {full_csv}, {full_md}")
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -593,17 +709,37 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         description="Async OWASP-2026 red-team runner for Llama-Sahabat-AI v2",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    parser.add_argument("--phase", required=True, choices=["baseline", "mitigated"])
+    parser.add_argument(
+        "--phase",
+        default="all",
+        choices=["baseline", "mitigated", "all"],
+        help="campaign phase to run ('all' runs baseline + mitigated + evaluation)",
+    )
     parser.add_argument("--dataset", default=str(ROOT / "dataset" / "owasp_2026_id.csv"))
     parser.add_argument("--output", default=str(ROOT / "reports"))
     parser.add_argument("--concurrency", type=int, default=1)
     parser.add_argument("--base-url", default=DEFAULT_BASE_URL)
     parser.add_argument("--app-url", default=DEFAULT_APP_URL, help="remote app_server base URL")
     parser.add_argument(
+        "--ssh",
+        default="",
+        help="one-flag SSH target '[user@]host[:port]' for automatic port-forwarding",
+    )
+    parser.add_argument("--ssh-host", default=DEFAULT_SSH_HOST, help="Runpod/remote SSH host or IP")
+    parser.add_argument("--ssh-port", type=int, default=DEFAULT_SSH_PORT, help="Runpod/remote SSH port")
+    parser.add_argument("--ssh-user", default=DEFAULT_SSH_USER, help="Runpod/remote SSH username")
+    parser.add_argument("--ssh-key", default=DEFAULT_SSH_KEY, help="optional SSH private key path (-i)")
+    parser.add_argument(
+        "--remote-app-port",
+        type=int,
+        default=DEFAULT_REMOTE_APP_PORT,
+        help="remote app_server port on the testbed host",
+    )
+    parser.add_argument(
         "--mode",
         choices=["auto", "direct", "remote"],
         default=DEFAULT_RUNNER_MODE,
-        help="auto uses --app-url/APP_BASE_URL when present",
+        help="auto uses SSH tunnel or --app-url/APP_BASE_URL when present",
     )
     parser.add_argument("--model", default=DEFAULT_MODEL)
     parser.add_argument("--timeout", type=float, default=600.0)
@@ -629,23 +765,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
-async def amain(args: argparse.Namespace) -> int:
-    cases = load_dataset(args.dataset)
-    if args.test_id:
-        wanted = set(args.test_id)
-        cases = [c for c in cases if c.test_id in wanted]
-    if args.limit:
-        cases = cases[: args.limit]
-    if not cases:
-        print("no test cases selected", file=sys.stderr)
-        return 2
-
-    app_url = (args.app_url or os.getenv("APP_BASE_URL", "")).rstrip("/")
-    remote = args.mode == "remote" or (args.mode == "auto" and bool(app_url))
-    if remote and not app_url:
-        print("remote mode requires --app-url or APP_BASE_URL", file=sys.stderr)
-        return 2
-
+async def _execute_campaign(
+    args: argparse.Namespace,
+    cases: list[TestCase],
+    *,
+    app_url: str,
+    remote: bool,
+) -> int:
     if remote:
         try:
             async with httpx.AsyncClient(timeout=10.0) as client:
@@ -693,39 +819,81 @@ async def amain(args: argparse.Namespace) -> int:
         )
 
     guardrails = None if remote else GuardrailPipeline(rag_filter=rag_filter)
-
-    runner = TestRunner(
-        phase=args.phase,
-        base_url=args.base_url,
-        model=args.model,
-        output_dir=Path(args.output),
-        concurrency=args.concurrency,
-        timeout=args.timeout,
-        temperature=args.temperature,
-        top_p=args.top_p,
-        top_k=args.top_k,
-        seed=args.seed,
-        repeat_penalty=args.repeat_penalty,
-        num_ctx=args.num_ctx,
-        num_predict=args.num_predict,
-        system_prompt=args.system_prompt,
-        guardrails=guardrails,
-        use_rag=args.use_rag,
-        app_url=app_url if remote else "",
-        append=args.append,
-        verbose=not args.quiet,
-    )
-    _, csv_path = await runner.run(cases)
-    runner.print_summary(csv_path)
-
-    # exit non-zero if every request failed (useful in CI)
+    phases = ["baseline", "mitigated"] if args.phase == "all" else [args.phase]
     from metrics.evaluate import load_report
 
-    df = load_report(csv_path)
-    if not bool(df["success"].map(lambda v: str(v).strip().casefold() in {"true", "1"}).any()):
-        print("all requests failed", file=sys.stderr)
-        return 1
+    for phase in phases:
+        runner = TestRunner(
+            phase=phase,
+            base_url=args.base_url,
+            model=args.model,
+            output_dir=Path(args.output),
+            concurrency=args.concurrency,
+            timeout=args.timeout,
+            temperature=args.temperature,
+            top_p=args.top_p,
+            top_k=args.top_k,
+            seed=args.seed,
+            repeat_penalty=args.repeat_penalty,
+            num_ctx=args.num_ctx,
+            num_predict=args.num_predict,
+            system_prompt=args.system_prompt,
+            guardrails=guardrails,
+            use_rag=args.use_rag,
+            app_url=app_url if remote else "",
+            append=args.append,
+            verbose=not args.quiet,
+        )
+        _, csv_path = await runner.run(cases)
+        runner.print_summary(csv_path)
+
+        df = load_report(csv_path)
+        if not bool(df["success"].map(lambda v: str(v).strip().casefold() in {"true", "1"}).any()):
+            print(f"all requests failed in phase {phase}", file=sys.stderr)
+            return 1
     return 0
+
+
+async def amain(args: argparse.Namespace) -> int:
+    cases = load_dataset(args.dataset)
+    if args.test_id:
+        wanted = set(args.test_id)
+        cases = [c for c in cases if c.test_id in wanted]
+    if args.limit:
+        cases = cases[: args.limit]
+    if not cases:
+        print("no test cases selected", file=sys.stderr)
+        return 2
+
+    ssh_user, ssh_host, ssh_port = parse_ssh_target(
+        args.ssh,
+        args.ssh_user,
+        args.ssh_host,
+        args.ssh_port,
+    )
+    if ssh_host and args.mode != "direct":
+        try:
+            with open_ssh_tunnel(
+                user=ssh_user,
+                host=ssh_host,
+                port=ssh_port,
+                remote_port=args.remote_app_port,
+                identity_file=args.ssh_key,
+            ) as tunneled_url:
+                return await _execute_campaign(
+                    args, cases, app_url=tunneled_url, remote=True
+                )
+        except RuntimeError as exc:
+            print(f"SSH tunnel error: {exc}", file=sys.stderr)
+            return 1
+
+    app_url = (args.app_url or os.getenv("APP_BASE_URL", "")).rstrip("/")
+    remote = args.mode == "remote" or (args.mode == "auto" and bool(app_url))
+    if remote and not app_url:
+        print("remote mode requires --ssh, --ssh-host, --app-url, or APP_BASE_URL", file=sys.stderr)
+        return 2
+
+    return await _execute_campaign(args, cases, app_url=app_url, remote=remote)
 
 
 def main(argv: list[str] | None = None) -> int:

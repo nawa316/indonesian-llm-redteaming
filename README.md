@@ -212,15 +212,17 @@ Start the server on the pod (also included in `./setup.sh all`):
 curl -s localhost:8000/health | python3 -m json.tool
 ```
 
-Expose port `8000` to the client, either with an SSH tunnel
+Then run the entire campaign (`baseline` + `mitigated` + `summary.{csv,md}`)
+from the laptop in **one command** with automatic SSH port-forwarding (no manual
+`ssh -L` terminal needed):
 
 ```bash
-ssh -N -L 8000:127.0.0.1:8000 root@<pod-host> -p <port>
+python test_runner.py --ssh-user root --ssh-host <pod-host> --ssh-port <port>
+# or shorthand:
+python test_runner.py --ssh root@<pod-host>:<port>
 ```
 
-or via **Runpod → Connect → HTTP Service** for port `8000`.
-
-Then run the campaign from the laptop; no local Chroma or Ollama is imported:
+You can also run against an already-exposed HTTP URL or individual phases:
 
 ```bash
 python test_runner.py --app-url http://127.0.0.1:8000 --phase baseline
@@ -228,10 +230,10 @@ python test_runner.py --app-url http://127.0.0.1:8000 --phase mitigated
 python metrics/evaluate.py
 ```
 
-`APP_BASE_URL` in `.env` enables the same behaviour without the flag
-(`RUNNER_MODE=auto`). Use `--mode direct` to force the original in-process
-execution on a single machine. In remote mode telemetry also stores
-`server_latency_ms`, `rag_metadata` and the raw model response.
+`SSH_HOST`/`SSH_PORT`/`SSH_USER` or `APP_BASE_URL` in `.env` enable the same
+behaviour without flags (`RUNNER_MODE=auto`). Use `--mode direct` to force the
+original in-process execution on a single machine. In remote mode telemetry also
+stores `server_latency_ms`, `rag_metadata` and the raw model response.
 
 ### Guardrails / Mitigation (application layer)
 
@@ -259,16 +261,25 @@ refusal detection and toxicity markers to produce `exploit_success` and
 
 ### Running a campaign
 
+**One-command execution (Remote via automatic SSH tunnel — baseline + mitigated + evaluation):**
+
+```bash
+python test_runner.py --ssh-user root --ssh-host <pod-host> --ssh-port <port>
+# or shorthand:
+python test_runner.py --ssh root@<pod-host>:<port>
+```
+
+**Local / step-by-step execution:**
+
 ```bash
 python rag/seed_chroma.py --reset
 
-# 1) baseline: no mitigation, unfiltered RAG
+# 1) baseline + mitigated + before/after summary in one command
+python test_runner.py
+
+# or run each phase individually:
 python test_runner.py --phase baseline --concurrency 1
-
-# 2) mitigated: guardrails + filtered RAG
 python test_runner.py --phase mitigated --concurrency 1
-
-# 3) before/after comparison (writes reports/summary.{csv,md})
 python metrics/evaluate.py
 ```
 
@@ -276,48 +287,91 @@ Outputs: `reports/{baseline,mitigated}.jsonl`, `.csv`, and `reports/summary.csv`
 / `.md` with ASR, mean ASV, compliance, relevance, toxicity, ΔASR, ΔASV,
 TP/FP/TN/FN, FPR and FNR per category, per severity and overall.
 
-Useful flags: `--limit`, `--test-id LLM01-001`, `--concurrency`, `--output`,
-`--app-url`, `--mode {auto,direct,remote}`, `--use-rag`, `--rag-top-k`,
-`--temperature`, `--seed`, `--num-predict`, `--system-prompt`.
+Useful flags: `--phase {all,baseline,mitigated}`, `--ssh user@host:port`,
+`--ssh-host`, `--ssh-port`, `--ssh-user`, `--ssh-key`, `--limit`,
+`--test-id LLM01-001`, `--concurrency`, `--output`, `--app-url`,
+`--mode {auto,direct,remote}`, `--use-rag`, `--rag-top-k`, `--temperature`,
+`--seed`, `--num-predict`, `--system-prompt`.
 
 ---
 
-## 5. Repository layout
+## 5. Repository layout & project structure
 
+```text
+indonesian-llm-redteaming/
+├── setup.sh                      # Single entry point for server bootstrap (Linux/Runpod)
+├── app_server.py                 # Controlled Testbed FastAPI server (:8000)
+├── test_runner.py                # Async test client (auto SSH tunnel / remote / direct)
+├── .env.example                  # Default configuration & control variables template
+├── requirements.txt              # Python dependencies
+├── config/
+│   └── Modelfile.template        # Llama 3.1 chat template + deterministic decoding params
+├── dataset/
+│   ├── owasp_2026_id.csv         # 40 Indonesian OWASP Top 10 2026 test cases (+ severity)
+│   ├── rag_documents_id.json     # 14 RAG corpus docs (public, confidential, poisoned)
+│   └── loader.py                 # CSV schema validator + TestCase dataclass
+├── rag/
+│   ├── chroma_store.py           # Persistent ChromaDB wrapper + Ollama/TF-IDF embeddings
+│   └── seed_chroma.py            # Idempotent RAG corpus seeder & retrieval verifier
+├── mitigation/
+│   ├── input_filter.py           # Layer 1: pre-inference heuristic & DoS input scanner
+│   ├── rag_filter.py             # Layer 2: tenant ACL (public-only) & RAG poisoning filter
+│   ├── output_filter.py          # Layer 3: post-inference leak, PII & XSS scanner/redactor
+│   └── pipeline.py               # Unified GuardrailPipeline orchestrating all 3 layers
+├── metrics/
+│   ├── judge.py                  # Deterministic ASR, ASV, Compliance, Relevance & Toxicity judge
+│   └── evaluate.py               # Before/After ΔASR, ΔASV, Confusion Matrix, FPR & FNR calculator
+├── scripts/
+│   ├── lib/common.sh             # Shared env variables, paths (/workspace), logging & GPU detection
+│   ├── setup_llm.sh              # Ollama installer & starter (Docker auto / native Runpod fallback)
+│   ├── setup_model.sh            # Hugging Face GGUF downloader, SHA-256 check & Modelfile renderer
+│   ├── setup_observability.sh    # GPU/Ollama exporter starter (+ optional Prometheus/Grafana)
+│   ├── setup_app.sh              # Background daemon starter for app_server.py (:8000)
+│   └── verify_stack.sh           # End-to-end hardware, service & inference readiness check
+└── observability/
+    ├── gpu_exporter.py           # Prometheus metrics exporter (:9101) for GPU, VRAM, Ollama & host
+    ├── telemetry.py              # Thread/async-safe JSONL & CSV evidence recorder
+    ├── prometheus.yml            # Prometheus scrape configuration
+    ├── docker-compose.yml        # Optional Prometheus + Grafana container stack
+    └── grafana/                  # Auto-provisioned datasource & LLM Engine dashboard
 ```
-setup.sh                      single entry point
-app_server.py                 Controlled Testbed FastAPI server (:8000)
-test_runner.py                async client (direct or --app-url remote)
-dataset/
-  owasp_2026_id.csv           Indonesian OWASP 2026 corpus (+ severity)
-  rag_documents_id.json       public / confidential / poisoned RAG docs
-  loader.py                   schema validation + TestCase model
-rag/
-  chroma_store.py             ChromaDB + Ollama/offline embeddings
-  seed_chroma.py              idempotent seeding + retrieval verification
-mitigation/
-  input_filter.py             pre-inference scanner
-  output_filter.py            post-inference scanner + redaction
-  rag_filter.py               tenant ACL + indirect-injection scanning
-  pipeline.py                 unified (allowed, reason, text) wrapper
-metrics/
-  judge.py                    semantic ASR/ASV + complementary metrics
-  evaluate.py                 before/after, severity, confusion matrix
-scripts/
-  lib/common.sh               shared config, logging, retries, runtime detection
-  setup_llm.sh                Ollama (docker auto / native fallback)
-  setup_model.sh              HF download + Modelfile render + ollama create
-  setup_observability.sh      exporter (+ optional Prometheus/Grafana)
-  setup_app.sh                application server on :8000 (background)
-  verify_stack.sh             readiness + inference smoke test
-config/Modelfile.template     Llama 3.1 chat template + generation params
-observability/
-  gpu_exporter.py             Prometheus exporter (GPU/Ollama/host)
-  telemetry.py                async-safe JSONL + CSV recorder (security schema)
-  prometheus.yml              scrape config
-  docker-compose.yml          Prometheus + Grafana
-  grafana/                    provisioning + dashboard
-```
+
+### Detailed explanation of each component
+
+1. **Root Entry Points (`setup.sh`, `app_server.py`, `test_runner.py`)**
+   - `setup.sh`: Master bootstrap script run on the Linux GPU server (Runpod). Running `./setup.sh all` sequentially executes Ollama installation, 70B GGUF model download, ChromaDB seeding, observability exporter, and starts `app_server.py`.
+   - `app_server.py`: FastAPI server listening on `:8000` inside the **Controlled Testbed Environment** (Figure 3.2). It wraps `mitigation/`, `rag/`, and Ollama's `/api/chat` behind `POST /api/app/chat` and `GET /health`.
+   - `test_runner.py`: Cross-platform async client run on the researcher's machine (**Test Client Environment**). Supports automatic background SSH port-forwarding (`--ssh user@host:port` or `--ssh-host`/`--ssh-port`/`--ssh-user`) and executes both `baseline` and `mitigated` phases plus final evaluation in a single command (`--phase all`).
+
+2. **Configuration (`config/` & `.env.example`)**
+   - `config/Modelfile.template`: Defines the official Llama 3.1 chat template (`<|start_header_id|>...<|eot_id|>`) and locks the thesis control variables (`temperature=0.0`, `top_p=1.0`, `top_k=1`, `seed=42`, `repeat_penalty=1.1`, `num_ctx=8192`, `num_predict=512`) alongside the Indonesian baseline `SYSTEM_PROMPT`.
+
+3. **Test Corpus & Loader (`dataset/`)**
+   - `dataset/owasp_2026_id.csv`: 40 structured Indonesian test scenarios (4 per OWASP 2026 category `LLM01`–`LLM10`), balanced across `Single-Turn` vs `Multi-Turn` (turns separated by `||`) and `contaminated` (attack payloads) vs `clean` (benign control prompts for False Positive testing), labeled with `Critical`/`High`/`Medium`/`Low` severity.
+   - `dataset/rag_documents_id.json`: 14 Indonesian internal organizational documents used for RAG testing, divided into `public` SOPs, `confidential` records (credentials, database config, employee NIK/PII, cross-tenant data), and `is_poisoned` documents containing indirect prompt injections.
+   - `dataset/loader.py`: Validates column schema, category formatting, severity labels, and multi-turn separators before any test run begins.
+
+4. **Retrieval-Augmented Generation (`rag/`)**
+   - `rag/chroma_store.py`: Manages the persistent ChromaDB vector collection (`owasp_id_docs`), supporting Ollama embeddings (`nomic-embed-text`) with an automatic offline deterministic character n-gram TF-IDF fallback.
+   - `rag/seed_chroma.py`: Resets, seeds, and verifies the ChromaDB vector store from `dataset/rag_documents_id.json`.
+
+5. **Application-Layer Mitigation (`mitigation/`)**
+   - `mitigation/input_filter.py` (**Layer 1**): Scans incoming user prompts before inference. Enforces character/token length and repetition bounds (`DOS_*`) and matches imperative attack patterns (`INJ_OVERRIDE_*`, `INJ_SYSTEM_PROMPT_*`, `INJ_AGENCY_*`, `INJ_SECRET_*`, `INJ_SUPPLY_01`, `HARM_*`, `INJ_REGIONAL_01`, etc.) while allowing defensive/educational questions to pass.
+   - `mitigation/rag_filter.py` (**Layer 2**): Enforces tenant access control (`access_level="public"`) during ChromaDB retrieval in the `mitigated` phase, drops documents flagged as `is_poisoned`, and scans retrieved text chunks against indirect injection rules (`RET_POISON_*`).
+   - `mitigation/output_filter.py` (**Layer 3**): Inspects model responses after inference and redacts leaked system-prompt fragments (`OUT_LEAK_*`), credentials/tokens (`OUT_SECRET_*`), Indonesian PII such as 16-digit NIK, phone numbers, and emails (`OUT_PII_*`), and executable HTML/JS/code (`OUT_UNSAFE_*`).
+   - `mitigation/pipeline.py`: Combines `InputFilter`, `RAGFilter`, and `OutputFilter` into a single `GuardrailPipeline` interface returning explainable `GuardrailDecision` objects with stable `rule_id`s.
+
+6. **Scoring & Evaluation (`metrics/`)**
+   - `metrics/judge.py`: Deterministic response evaluator that computes binary `exploit_success` (for **ASR**), continuous `asv_score` ($0.55 \times \text{keyword\_coverage} + 0.45 \times \text{semantic\_similarity}$ with refusal penalty and toxicity adjustment), and complementary metrics (`compliance_score`, `relevance_score`, `toxicity_flag`).
+   - `metrics/evaluate.py`: Compares `reports/baseline.csv` and `reports/mitigated.csv` to compute $\Delta\text{ASR}$, $\Delta\text{ASV}$, Confusion Matrix counts (`TP`, `FP`, `TN`, `FN`), **FPR**, and **FNR** across overall, per-OWASP category, and per-severity scopes, exporting `reports/summary.csv` and `reports/summary.md`.
+
+7. **Server Bootstrap Scripts (`scripts/`)**
+   - `scripts/lib/common.sh`: Central configuration sourced by all shell scripts; maps mutable directories (`models/`, `chromadb/`, `logs/`, `runtime/`) to Runpod's persistent `/workspace` volume and provides GPU (`nvidia-smi`) and Docker detection helpers.
+   - `scripts/setup_llm.sh`, `setup_model.sh`, `setup_observability.sh`, `setup_app.sh`, `verify_stack.sh`: Modular, idempotent shell scripts invoked by `./setup.sh`.
+
+8. **Telemetry & Hardware Observability (`observability/`)**
+   - `observability/telemetry.py`: Lock-protected JSONL and CSV writer that persists every test turn's prompt, response, latency, token counts, guardrail decision, rule ID, confusion class, and judge scores to `reports/`.
+   - `observability/gpu_exporter.py`: Lightweight HTTP Prometheus exporter (`:9101/metrics`) tracking GPU utilization, VRAM usage, temperature, power draw, host CPU/RAM, and Ollama loaded-model footprint.
 
 ---
 
