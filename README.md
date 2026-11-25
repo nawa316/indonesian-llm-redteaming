@@ -16,7 +16,7 @@ hosts with Docker.
 ```
 ┌──────────────────────────── pod / host ────────────────────────────┐
 │                                                                    │
-│  test runner / guardrails            (next milestone)              │
+│  test runner / mitigation            (next milestone)              │
 │        │  HTTP /api/chat                                           │
 │        ▼                                                           │
 │  ┌──────────────┐   nvidia-smi    ┌──────────────────────────┐     │
@@ -193,14 +193,14 @@ python test_runner.py --phase baseline --use-rag
 
 ### Client-server split (Figure 3.2)
 
-`app_server.py` hosts the **Controlled Testbed**: guardrails, ChromaDB RAG and
+`app_server.py` hosts the **Controlled Testbed**: mitigation, ChromaDB RAG and
 Ollama. The runner then only needs network access, no GPU or local models.
 
 ```
 Test Client (laptop)                         Controlled Testbed (Runpod)
 ┌───────────────────────┐   HTTP/JSON       ┌──────────────────────────────┐
 │ test_runner.py        │ ────────────────► │ app_server.py :8000          │
-│ judge + Telemetry     │ ◄──────────────── │ guardrails → RAG → Ollama    │
+│ judge + Telemetry     │ ◄──────────────── │ mitigation → RAG → Ollama    │
 │ reports/*.jsonl|csv   │                   │ ChromaDB + Llama-Sahabat 70B │
 └───────────────────────┘                   └──────────────────────────────┘
 ```
@@ -235,7 +235,7 @@ behaviour without flags (`RUNNER_MODE=auto`). Use `--mode direct` to force the
 original in-process execution on a single machine. In remote mode telemetry also
 stores `server_latency_ms`, `rag_metadata` and the raw model response.
 
-### Guardrails / Mitigation (application layer)
+### Mitigation (application layer)
 
 | Module | Purpose |
 |---|---|
@@ -382,7 +382,7 @@ indonesian-llm-redteaming/
 - [x] Indonesian OWASP 2026 test corpus with severity labels
 - [x] ChromaDB RAG with tenant ACL + indirect-injection filtering
 - [x] Client-server split (app_server :8000 ↔ remote test_runner)
-- [x] Application-layer guardrails (input/output/RAG, explainable rule ids)
+- [x] Application-layer mitigation (input/output/RAG, explainable rule ids)
 - [x] Async `test_runner.py` (baseline ASR/ASV + mitigated confusion matrix)
 - [x] Semantic ASV + compliance/relevance/toxicity metrics
 - [x] Before/after analysis, per-severity, FPR/FNR, Markdown/CSV reports
