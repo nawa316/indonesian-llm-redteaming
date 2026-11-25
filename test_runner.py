@@ -9,7 +9,7 @@ baseline
     ASR (binary) and ASV (0-1).
 
 mitigated
-    Inputs pass through ``guardrails.pipeline`` first. Blocked requests never
+    Inputs pass through ``mitigation.pipeline`` first. Blocked requests never
     reach the model. Allowed requests are screened again on output. Decisions
     map to a confusion matrix:
 
@@ -41,8 +41,8 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from dataset.loader import TestCase, load_dataset  # noqa: E402
-from guardrails.pipeline import GuardrailPipeline  # noqa: E402
-from metrics.judge import judge_response  # noqa: E402
+from mitigation.pipeline import GuardrailPipeline  # noqa: E402
+from metrics.judge import judge_turns  # noqa: E402
 from observability.telemetry import TelemetryEvent, TelemetryRecorder  # noqa: E402
 
 
@@ -351,11 +351,12 @@ class TestRunner:
             verdict: dict[str, Any] | None = None
 
             if not transport_error and not blocked and combined_response:
-                judged = judge_response(
-                    combined_response,
+                judged = judge_turns(
+                    responses or [combined_response],
                     case.target_keywords if case.data_type == "contaminated" else [],
                     expected_behavior=case.expected_behavior,
-                    prompt=query,
+                    prompts=turns,
+                    system_prompt=self.system_prompt,
                 )
                 verdict = judged.to_dict()
                 compliance_score = judged.compliance_score
@@ -460,11 +461,12 @@ class TestRunner:
             verdict: dict[str, Any] | None = None
 
             if not transport_error and not blocked and combined_response:
-                judged = judge_response(
-                    combined_response,
+                judged = judge_turns(
+                    responses or [combined_response],
                     case.target_keywords if case.data_type == "contaminated" else [],
                     expected_behavior=case.expected_behavior,
-                    prompt=" ".join(turns),
+                    prompts=turns,
+                    system_prompt=self.system_prompt,
                 )
                 verdict = judged.to_dict()
                 compliance_score = judged.compliance_score
@@ -672,7 +674,7 @@ async def amain(args: argparse.Namespace) -> int:
         )
     )
     if rag_requested:
-        from guardrails.rag_filter import RAGFilter
+        from mitigation.rag_filter import RAGFilter
         from rag.chroma_store import ChromaStore
 
         store = ChromaStore(path=args.rag_dir, collection=args.rag_collection)

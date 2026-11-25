@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Unified application-layer guardrail pipeline.
 
-    from guardrails.pipeline import GuardrailPipeline
+    from mitigation.pipeline import GuardrailPipeline
 
     pipeline = GuardrailPipeline()
     allowed, reason, sanitized = pipeline.process(prompt)
@@ -18,11 +18,11 @@ import os
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
-from guardrails.input_filter import InputFilter
-from guardrails.output_filter import OutputFilter
+from mitigation.input_filter import InputFilter
+from mitigation.output_filter import OutputFilter
 
 if TYPE_CHECKING:
-    from guardrails.rag_filter import RAGFilter, RAGResult
+    from mitigation.rag_filter import RAGFilter, RAGResult
 
 
 @dataclass(frozen=True)

@@ -28,8 +28,8 @@ from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 from starlette.concurrency import run_in_threadpool
 
-from guardrails.pipeline import GuardrailPipeline
-from guardrails.rag_filter import RAGFilter
+from mitigation.pipeline import GuardrailPipeline
+from mitigation.rag_filter import RAGFilter
 from rag.chroma_store import ChromaStore
 
 APP_HOST = os.getenv("APP_HOST", "0.0.0.0")

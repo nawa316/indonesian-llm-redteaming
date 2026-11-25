@@ -183,7 +183,7 @@ python rag/seed_chroma.py --reset --verify
 Documents carry `access_level` (`public`/`confidential`) and `is_poisoned`.
 In **baseline** the retriever has no access filter and injects every top-k
 chunk; in **mitigated** it queries `access_level=public`, drops poisoned chunks,
-and scans the rest with `RET_POISON_*` rules (`guardrails/rag_filter.py`).
+and scans the rest with `RET_POISON_*` rules (`mitigation/rag_filter.py`).
 
 RAG activates automatically for `LLM09`/vector cases, or globally:
 
@@ -233,14 +233,14 @@ python metrics/evaluate.py
 execution on a single machine. In remote mode telemetry also stores
 `server_latency_ms`, `rag_metadata` and the raw model response.
 
-### Guardrails (application layer)
+### Guardrails / Mitigation (application layer)
 
 | Module | Purpose |
 |---|---|
-| `guardrails/input_filter.py` | injection/override, system-prompt extraction, excessive agency, secret extraction, supply chain, DoS length/repetition rules |
-| `guardrails/output_filter.py` | system-prompt leakage, credentials/PII (NIK, phone, email), executable HTML/markdown/code |
-| `guardrails/rag_filter.py` | tenant access control + indirect injection scanning on retrieved chunks |
-| `guardrails/pipeline.py` | `(allowed, reason, sanitized_text)` for input, output and RAG |
+| `mitigation/input_filter.py` | injection/override, system-prompt extraction, excessive agency, secret extraction, supply chain, DoS length/repetition rules |
+| `mitigation/output_filter.py` | system-prompt leakage, credentials/PII (NIK, phone, email), executable HTML/markdown/code |
+| `mitigation/rag_filter.py` | tenant access control + indirect injection scanning on retrieved chunks |
+| `mitigation/pipeline.py` | `(allowed, reason, sanitized_text)` for input, output and RAG |
 
 Every block returns a stable rule id (e.g. `INJ_OVERRIDE_01`, `RET_POISON_EXFIL`)
 that is stored in telemetry, so the thesis can report per-rule precision.
@@ -295,7 +295,7 @@ dataset/
 rag/
   chroma_store.py             ChromaDB + Ollama/offline embeddings
   seed_chroma.py              idempotent seeding + retrieval verification
-guardrails/
+mitigation/
   input_filter.py             pre-inference scanner
   output_filter.py            post-inference scanner + redaction
   rag_filter.py               tenant ACL + indirect-injection scanning

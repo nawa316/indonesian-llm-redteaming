@@ -83,9 +83,13 @@ def compute_scope(df: pd.DataFrame) -> dict[str, float | int]:
     contaminated = df[df["data_type"] == "contaminated"]
     clean = df[df["data_type"] == "clean"]
     n_contaminated = len(contaminated)
+    n_clean = len(clean)
 
-    def mean(column: str) -> float:
+    def mean_contam(column: str) -> float:
         return float(contaminated[column].mean()) if n_contaminated else float("nan")
+
+    def mean_clean(column: str) -> float:
+        return float(clean[column].mean()) if n_clean else float("nan")
 
     tp = int((df["confusion_class"] == "TP").sum())
     fp = int((df["confusion_class"] == "FP").sum())
@@ -94,11 +98,12 @@ def compute_scope(df: pd.DataFrame) -> dict[str, float | int]:
 
     return {
         "n": n_contaminated,
-        "n_clean": len(clean),
+        "n_clean": n_clean,
         "asr": (100.0 * float(contaminated["exploit_success"].mean())) if n_contaminated else float("nan"),
-        "asv": mean("asv_score"),
-        "compliance": mean("compliance_score"),
-        "relevance": mean("relevance_score"),
+        "asv": mean_contam("asv_score"),
+        "compliance": mean_contam("compliance_score"),
+        "relevance_clean": mean_clean("relevance_score"),
+        "relevance_contaminated": mean_contam("relevance_score"),
         "toxicity": (100.0 * float(contaminated["toxicity_flag"].mean())) if n_contaminated else float("nan"),
         "tp": tp,
         "fp": fp,
@@ -146,7 +151,19 @@ def summarize(baseline: pd.DataFrame, mitigated: pd.DataFrame | None) -> pd.Data
         if mitigated is not None:
             mit = compute_scope(_select(mitigated, kind, value))
         else:
-            mit = {k: float("nan") for k in ("asr", "asv", "compliance", "relevance", "toxicity", "fpr", "fnr")}
+            mit = {
+                k: float("nan")
+                for k in (
+                    "asr",
+                    "asv",
+                    "compliance",
+                    "relevance_clean",
+                    "relevance_contaminated",
+                    "toxicity",
+                    "fpr",
+                    "fnr",
+                )
+            }
             mit.update({"n": 0, "n_clean": 0, "tp": 0, "fp": 0, "tn": 0, "fn": 0})
 
         def delta(key: str) -> float:
@@ -160,13 +177,15 @@ def summarize(baseline: pd.DataFrame, mitigated: pd.DataFrame | None) -> pd.Data
             "baseline_asr_pct": base["asr"],
             "baseline_asv": base["asv"],
             "baseline_compliance": base["compliance"],
-            "baseline_relevance": base["relevance"],
+            "baseline_relevance_clean": base["relevance_clean"],
+            "baseline_relevance_contaminated": base["relevance_contaminated"],
             "baseline_toxicity_pct": base["toxicity"],
             "mitigated_n": mit["n"],
             "mitigated_asr_pct": mit["asr"],
             "mitigated_asv": mit["asv"],
             "mitigated_compliance": mit["compliance"],
-            "mitigated_relevance": mit["relevance"],
+            "mitigated_relevance_clean": mit["relevance_clean"],
+            "mitigated_relevance_contaminated": mit["relevance_contaminated"],
             "mitigated_toxicity_pct": mit["toxicity"],
             "asr_reduction_pp": delta("asr"),
             "asv_reduction": delta("asv"),
@@ -218,20 +237,23 @@ def render_markdown(table: pd.DataFrame, *, baseline_path: str, mitigated_path: 
         "",
         "## Complementary metrics and confusion matrix",
         "",
-        "| Scope | Base Comply | Base Relev | Base Toxic % | Mitig. Comply | Mitig. Relev "
-        "| Mitig. Toxic % | TP | FP | TN | FN | FPR % | FNR % |",
-        "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
+        "| Scope | Base Comply | Base Relev (Clean) | Base Relev (Contam) | Base Toxic % "
+        "| Mitig. Comply | Mitig. Relev (Clean) | Mitig. Relev (Contam) | Mitig. Toxic % "
+        "| TP | FP | TN | FN | FPR % | FNR % |",
+        "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
     ]
     for _, row in table.iterrows():
         lines.append(
-            "| {scope} | {bc} | {br} | {bt} | {mc} | {mr} | {mt} "
+            "| {scope} | {bc} | {brc} | {brx} | {bt} | {mc} | {mrc} | {mrx} | {mt} "
             "| {tp} | {fp} | {tn} | {fn} | {fpr} | {fnr} |".format(
                 scope=row["scope"],
                 bc=_fmt(row["baseline_compliance"], 3),
-                br=_fmt(row["baseline_relevance"], 3),
+                brc=_fmt(row["baseline_relevance_clean"], 3),
+                brx=_fmt(row["baseline_relevance_contaminated"], 3),
                 bt=_fmt(row["baseline_toxicity_pct"]),
                 mc=_fmt(row["mitigated_compliance"], 3),
-                mr=_fmt(row["mitigated_relevance"], 3),
+                mrc=_fmt(row["mitigated_relevance_clean"], 3),
+                mrx=_fmt(row["mitigated_relevance_contaminated"], 3),
                 mt=_fmt(row["mitigated_toxicity_pct"]),
                 tp=int(row["tp"]),
                 fp=int(row["fp"]),
