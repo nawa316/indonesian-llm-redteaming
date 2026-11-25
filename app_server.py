@@ -30,6 +30,11 @@ from starlette.concurrency import run_in_threadpool
 
 from mitigation.pipeline import GuardrailPipeline
 from mitigation.rag_filter import RAGFilter
+from observability.system_report import (
+    collect_system_snapshot,
+    load_setup_report,
+    utc_now_iso,
+)
 from rag.chroma_store import ChromaStore
 
 APP_HOST = os.getenv("APP_HOST", "0.0.0.0")
@@ -67,6 +72,63 @@ class ChatRequest(BaseModel):
     options: dict[str, Any] = Field(default_factory=dict)
 
 
+class ApiMetrics:
+    def __init__(self) -> None:
+        self.total_requests: int = 0
+        self.health_requests: int = 0
+        self.chat_requests: int = 0
+        self.report_requests: int = 0
+        self.by_phase: dict[str, int] = {"baseline": 0, "mitigated": 0}
+        self.guardrail_blocked: int = 0
+        self.errors: int = 0
+        self.prompt_tokens: int = 0
+        self.completion_tokens: int = 0
+        self.latencies_ms: list[float] = []
+
+    def record_chat(
+        self,
+        *,
+        phase: str,
+        latency_ms: float,
+        blocked: bool = False,
+        error: bool = False,
+        prompt_tokens: int = 0,
+        completion_tokens: int = 0,
+    ) -> None:
+        self.total_requests += 1
+        self.chat_requests += 1
+        self.by_phase[phase] = self.by_phase.get(phase, 0) + 1
+        if blocked:
+            self.guardrail_blocked += 1
+        if error:
+            self.errors += 1
+        self.prompt_tokens += int(prompt_tokens)
+        self.completion_tokens += int(completion_tokens)
+        self.latencies_ms.append(float(latency_ms))
+
+    def to_dict(self) -> dict[str, Any]:
+        lats = self.latencies_ms
+        return {
+            "total_requests": self.total_requests,
+            "health_requests": self.health_requests,
+            "chat_requests": self.chat_requests,
+            "report_requests": self.report_requests,
+            "by_phase": dict(self.by_phase),
+            "guardrail_blocked": self.guardrail_blocked,
+            "errors": self.errors,
+            "tokens": {
+                "prompt": self.prompt_tokens,
+                "completion": self.completion_tokens,
+            },
+            "latency_ms": {
+                "min": round(min(lats), 3) if lats else 0.0,
+                "avg": round(sum(lats) / len(lats), 3) if lats else 0.0,
+                "max": round(max(lats), 3) if lats else 0.0,
+                "total": round(sum(lats), 3) if lats else 0.0,
+            },
+        }
+
+
 class ServerState:
     store: ChromaStore | None = None
     pipeline: GuardrailPipeline | None = None
@@ -74,6 +136,7 @@ class ServerState:
     client: httpx.AsyncClient | None = None
     store_error: str = ""
     started_at: float = time.time()
+    metrics: ApiMetrics = ApiMetrics()
 
 
 state = ServerState()
@@ -132,6 +195,8 @@ async def _ollama_health() -> tuple[bool, bool]:
 
 @app.get("/health")
 async def health() -> dict[str, Any]:
+    state.metrics.total_requests += 1
+    state.metrics.health_requests += 1
     ollama_up, model_available = await _ollama_health()
     return {
         "status": "ok" if ollama_up and state.pipeline is not None else "degraded",
@@ -142,6 +207,46 @@ async def health() -> dict[str, Any]:
         "chroma_error": state.store_error,
         "guardrails": state.pipeline is not None,
         "uptime_seconds": round(time.time() - state.started_at, 1),
+    }
+
+
+@app.get("/api/app/report")
+async def server_report() -> dict[str, Any]:
+    """Return server-side timing, setup, API, and hardware (CPU/RAM/GPU) report."""
+    state.metrics.total_requests += 1
+    state.metrics.report_requests += 1
+    ollama_up, model_available = await _ollama_health()
+    loaded_models: list[dict[str, Any]] = []
+    if ollama_up and state.client is not None:
+        try:
+            ps = await state.client.get(f"{OLLAMA_BASE_URL}/api/ps", timeout=3.0)
+            ps.raise_for_status()
+            loaded_models = ps.json().get("models", [])
+        except (httpx.HTTPError, ValueError):
+            loaded_models = []
+
+    system_info = await run_in_threadpool(collect_system_snapshot)
+    setup_info = await run_in_threadpool(load_setup_report)
+    return {
+        "ts_utc": utc_now_iso(),
+        "server": {
+            "uptime_seconds": round(time.time() - state.started_at, 1),
+            "ollama_up": ollama_up,
+            "model": OLLAMA_MODEL,
+            "model_available": model_available,
+            "loaded_models": [
+                {
+                    "name": m.get("name") or m.get("model") or "unknown",
+                    "size_bytes": int(m.get("size") or 0),
+                    "size_vram_bytes": int(m.get("size_vram") or 0),
+                }
+                for m in loaded_models
+            ],
+            "chroma_docs": state.store.count() if state.store is not None else 0,
+        },
+        "setup": setup_info,
+        "api": state.metrics.to_dict(),
+        "system": system_info,
     }
 
 
@@ -173,6 +278,10 @@ async def chat(request: ChatRequest) -> dict[str, Any]:
     if request.phase == "mitigated":
         decision = state.pipeline.screen_input(latest_user)
         if not decision.allowed:
+            latency_ms = round((time.perf_counter() - started) * 1000, 3)
+            state.metrics.record_chat(
+                phase=request.phase, latency_ms=latency_ms, blocked=True
+            )
             return {
                 "response": "",
                 "raw_response": "",
@@ -182,7 +291,7 @@ async def chat(request: ChatRequest) -> dict[str, Any]:
                 "rule_id": decision.rule_id,
                 "prompt_tokens": 0,
                 "completion_tokens": 0,
-                "server_latency_ms": round((time.perf_counter() - started) * 1000, 3),
+                "server_latency_ms": latency_ms,
                 "rag_metadata": rag_metadata,
                 "model": OLLAMA_MODEL,
             }
@@ -226,11 +335,21 @@ async def chat(request: ChatRequest) -> dict[str, Any]:
         ollama_response.raise_for_status()
         data = ollama_response.json()
     except httpx.HTTPStatusError as exc:
+        state.metrics.record_chat(
+            phase=request.phase,
+            latency_ms=round((time.perf_counter() - started) * 1000, 3),
+            error=True,
+        )
         raise HTTPException(
             status_code=502,
             detail=f"Ollama HTTP {exc.response.status_code}: {exc.response.text[:300]}",
         ) from exc
     except (httpx.HTTPError, ValueError) as exc:
+        state.metrics.record_chat(
+            phase=request.phase,
+            latency_ms=round((time.perf_counter() - started) * 1000, 3),
+            error=True,
+        )
         raise HTTPException(status_code=502, detail=f"Ollama error: {exc}") from exc
 
     raw_response = (data.get("message") or {}).get("content", "") or ""
@@ -246,6 +365,17 @@ async def chat(request: ChatRequest) -> dict[str, Any]:
             rule_id = out_decision.rule_id
             final_response = out_decision.sanitized_text or "[DIBLOKIR OLEH GUARDRAIL OUTPUT]"
 
+    latency_ms = round((time.perf_counter() - started) * 1000, 3)
+    p_tokens = int(data.get("prompt_eval_count") or 0)
+    c_tokens = int(data.get("eval_count") or 0)
+    state.metrics.record_chat(
+        phase=request.phase,
+        latency_ms=latency_ms,
+        blocked=blocked,
+        prompt_tokens=p_tokens,
+        completion_tokens=c_tokens,
+    )
+
     return {
         "response": final_response,
         "raw_response": raw_response,
@@ -253,9 +383,9 @@ async def chat(request: ChatRequest) -> dict[str, Any]:
         "block_stage": block_stage,
         "guardrail_reason": guardrail_reason,
         "rule_id": rule_id,
-        "prompt_tokens": int(data.get("prompt_eval_count") or 0),
-        "completion_tokens": int(data.get("eval_count") or 0),
-        "server_latency_ms": round((time.perf_counter() - started) * 1000, 3),
+        "prompt_tokens": p_tokens,
+        "completion_tokens": c_tokens,
+        "server_latency_ms": latency_ms,
         "rag_metadata": rag_metadata,
         "model": OLLAMA_MODEL,
     }

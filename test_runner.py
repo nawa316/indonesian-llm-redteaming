@@ -47,6 +47,12 @@ if str(ROOT) not in sys.path:
 from dataset.loader import TestCase, load_dataset  # noqa: E402
 from mitigation.pipeline import GuardrailPipeline  # noqa: E402
 from metrics.judge import judge_turns  # noqa: E402
+from observability.system_report import (  # noqa: E402
+    collect_system_snapshot,
+    load_setup_report,
+    render_system_report_markdown,
+    utc_now_iso,
+)
 from observability.telemetry import TelemetryEvent, TelemetryRecorder  # noqa: E402
 
 
@@ -822,7 +828,13 @@ async def _execute_campaign(
     phases = ["baseline", "mitigated"] if args.phase == "all" else [args.phase]
     from metrics.evaluate import load_report
 
+    campaign_started_utc = utc_now_iso()
+    campaign_started_perf = time.perf_counter()
+    phase_timings: list[dict[str, Any]] = []
+    exit_code = 0
+
     for phase in phases:
+        phase_started = time.perf_counter()
         runner = TestRunner(
             phase=phase,
             base_url=args.base_url,
@@ -845,13 +857,59 @@ async def _execute_campaign(
             verbose=not args.quiet,
         )
         _, csv_path = await runner.run(cases)
+        phase_elapsed = round(time.perf_counter() - phase_started, 3)
+        phase_timings.append(
+            {
+                "phase": phase,
+                "cases": len(cases),
+                "elapsed_seconds": phase_elapsed,
+                "cases_per_second": round(len(cases) / phase_elapsed, 4) if phase_elapsed > 0 else 0.0,
+            }
+        )
         runner.print_summary(csv_path)
 
         df = load_report(csv_path)
         if not bool(df["success"].map(lambda v: str(v).strip().casefold() in {"true", "1"}).any()):
             print(f"all requests failed in phase {phase}", file=sys.stderr)
-            return 1
-    return 0
+            exit_code = 1
+            break
+
+    # Collect & persist final system/setup/API report on the client
+    server_report: dict[str, Any] | None = None
+    if remote:
+        try:
+            async with httpx.AsyncClient(timeout=15.0) as client:
+                resp = await client.get(f"{app_url}/api/app/report")
+                resp.raise_for_status()
+                server_report = resp.json()
+        except (httpx.HTTPError, ValueError) as exc:
+            print(f"WARNING: could not fetch server report from {app_url}/api/app/report: {exc}", file=sys.stderr)
+
+    campaign_elapsed = round(time.perf_counter() - campaign_started_perf, 3)
+    combined_report: dict[str, Any] = {
+        "ts_utc": utc_now_iso(),
+        "execution_mode": "remote" if remote else "direct",
+        "campaign": {
+            "started_utc": campaign_started_utc,
+            "finished_utc": utc_now_iso(),
+            "elapsed_seconds": campaign_elapsed,
+            "phases": phase_timings,
+        },
+        "client_system": collect_system_snapshot(),
+        "server_report": server_report,
+    }
+    if not remote:
+        combined_report["setup"] = load_setup_report()
+        combined_report["system"] = combined_report["client_system"]
+
+    output_dir = Path(args.output)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    sys_json = output_dir / "system_report.json"
+    sys_md = output_dir / "system_report.md"
+    sys_json.write_text(json.dumps(combined_report, indent=2) + "\n", encoding="utf-8")
+    sys_md.write_text(render_system_report_markdown(combined_report), encoding="utf-8")
+    print(f"system/API report -> {sys_json}, {sys_md}", flush=True)
+    return exit_code
 
 
 async def amain(args: argparse.Namespace) -> int:
